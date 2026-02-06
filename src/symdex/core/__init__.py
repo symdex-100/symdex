@@ -6,7 +6,7 @@ Re-exports the primary classes for convenience::
     from symdex.core import Config, CodeAnalyzer, CypherCache
 """
 
-from symdex.core.config import Config, CypherSchema, LanguageRegistry, Prompts
+from symdex.core.config import Config, CypherSchema, Prompts
 from symdex.core.engine import (
     CodeAnalyzer,
     CypherCache,
@@ -21,7 +21,6 @@ from symdex.core.engine import (
 __all__ = [
     "Config",
     "CypherSchema",
-    "LanguageRegistry",
     "Prompts",
     "CodeAnalyzer",
     "CypherCache",

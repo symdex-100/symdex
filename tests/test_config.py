@@ -1,9 +1,9 @@
 """
-Tests for symdex.core.config — CypherSchema, LanguageRegistry, Config, Prompts.
+Tests for symdex.core.config — CypherSchema, Config, Prompts.
 """
 
 import pytest
-from symdex.core.config import Config, CypherSchema, LanguageRegistry, Prompts
+from symdex.core.config import Config, CypherSchema, Prompts
 
 
 # =============================================================================
@@ -48,72 +48,6 @@ class TestCypherSchema:
 
 
 # =============================================================================
-# LanguageRegistry tests
-# =============================================================================
-
-class TestLanguageRegistry:
-    """Verify language detection and registry completeness."""
-
-    @pytest.mark.parametrize("ext,expected_name", [
-        (".py", "Python"),
-        (".js", "JavaScript"),
-        (".jsx", "JavaScript"),
-        (".ts", "TypeScript"),
-        (".tsx", "TypeScript"),
-        (".java", "Java"),
-        (".go", "Go"),
-        (".rs", "Rust"),
-        (".c", "C"),
-        (".h", "C"),
-        (".cpp", "C++"),
-        (".cs", "C#"),
-        (".rb", "Ruby"),
-        (".php", "PHP"),
-        (".swift", "Swift"),
-        (".kt", "Kotlin"),
-    ])
-    def test_detect_language_by_extension(self, ext, expected_name):
-        # Fake a file path with the target extension
-        lang = LanguageRegistry.detect_language(f"project/src/file{ext}")
-        assert lang is not None, f"No language detected for {ext}"
-        assert lang["name"] == expected_name
-
-    def test_detect_language_unknown_extension(self):
-        assert LanguageRegistry.detect_language("data.csv") is None
-
-    def test_supported_extensions_covers_config(self):
-        """Every extension in Config.TARGET_EXTENSIONS should be registered."""
-        registered = LanguageRegistry.supported_extensions()
-        for ext in Config.TARGET_EXTENSIONS:
-            assert ext in registered, f"{ext} is in Config but not registered"
-
-    @pytest.mark.parametrize("lang_key", [
-        "python", "javascript", "typescript", "java", "go", "rust",
-        "c", "cpp", "csharp", "ruby", "php", "swift", "kotlin",
-    ])
-    def test_registered_language_has_required_fields(self, lang_key):
-        lang = LanguageRegistry.get_language(lang_key)
-        assert lang is not None, f"Language '{lang_key}' not registered"
-        assert "name" in lang
-        assert "comment_single" in lang
-        assert "extensions" in lang
-        assert "function_patterns" in lang
-        assert len(lang["function_patterns"]) >= 1, f"{lang_key} has no function patterns"
-
-    def test_python_uses_hash_comments(self):
-        lang = LanguageRegistry.get_language("python")
-        assert lang["comment_single"] == "#"
-
-    def test_javascript_uses_slash_comments(self):
-        lang = LanguageRegistry.get_language("javascript")
-        assert lang["comment_single"] == "//"
-
-    def test_ruby_uses_hash_comments(self):
-        lang = LanguageRegistry.get_language("ruby")
-        assert lang["comment_single"] == "#"
-
-
-# =============================================================================
 # Config tests
 # =============================================================================
 
@@ -123,20 +57,8 @@ class TestConfig:
     def test_target_extensions_includes_python(self):
         assert ".py" in Config.TARGET_EXTENSIONS
 
-    def test_target_extensions_includes_javascript(self):
-        assert ".js" in Config.TARGET_EXTENSIONS
-
-    def test_target_extensions_includes_typescript(self):
-        assert ".ts" in Config.TARGET_EXTENSIONS
-
-    def test_target_extensions_includes_go(self):
-        assert ".go" in Config.TARGET_EXTENSIONS
-
-    def test_target_extensions_includes_rust(self):
-        assert ".rs" in Config.TARGET_EXTENSIONS
-
     def test_exclude_dirs_has_common_entries(self):
-        for d in ("__pycache__", ".git", "node_modules", "dist", "build"):
+        for d in ("__pycache__", ".git", "dist", "build"):
             assert d in Config.EXCLUDE_DIRS
 
     def test_cypher_version_is_set(self):
@@ -211,27 +133,23 @@ class TestConfigLLMProvider:
 # =============================================================================
 
 class TestPrompts:
-    """Verify prompt templates are language-agnostic."""
+    """Verify prompt templates for Python."""
 
-    def test_generation_system_mentions_any_language(self):
+    def test_generation_system_mentions_python(self):
         prompt = Prompts.CYPHER_GENERATION_SYSTEM
-        assert "ANY programming language" in prompt
+        assert "Python" in prompt
 
-    def test_generation_system_has_multi_language_examples(self):
+    def test_generation_system_has_python_examples(self):
         prompt = Prompts.CYPHER_GENERATION_SYSTEM
-        # Should mention at least Python, JavaScript, Go, Rust
-        for lang in ("Python", "JavaScript", "Go", "Rust"):
-            assert lang in prompt, f"Missing {lang} example in system prompt"
+        assert "Python:" in prompt or "python" in prompt.lower()
 
-    def test_generation_user_has_language_placeholder(self):
+    def test_generation_user_has_code_placeholder(self):
         tpl = Prompts.CYPHER_GENERATION_USER
-        assert "{language}" in tpl
-        assert "{language_lower}" in tpl
         assert "{code}" in tpl
 
     def test_generation_user_renders_correctly(self):
         rendered = Prompts.CYPHER_GENERATION_USER.format(
-            language="Go", language_lower="go", code="func Foo() {}"
+            code="def foo(): pass"
         )
-        assert "Go" in rendered
-        assert "func Foo()" in rendered
+        assert "Python" in rendered
+        assert "def foo()" in rendered

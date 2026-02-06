@@ -1,8 +1,8 @@
 """
 Symdex-100 Core Engine
 
-Shared utilities for language-agnostic code analysis, caching,
-Cypher generation, and search scoring.
+Python-focused code analysis, caching, Cypher generation, and search scoring.
+Uses Python's AST module for precise function extraction.
 Production-grade with comprehensive error handling and logging.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
-from symdex.core.config import Config, CypherSchema, LanguageRegistry, Prompts
+from symdex.core.config import Config, CypherSchema, Prompts
 
 # Configure logging
 logging.basicConfig(
@@ -55,51 +55,38 @@ class FunctionMetadata:
 
 @dataclass
 class CypherMeta:
-    """Structured Cypher metadata."""
+    """Structured Cypher metadata (Python comment format)."""
     cypher: str
     tags: List[str]
     signature: str
     complexity: str
     version: str = Config.CYPHER_VERSION
     
-    def to_comment_block(self, comment_prefix: str = "#") -> str:
-        """
-        Generate the <SEARCH_META> comment block.
-        
-        Args:
-            comment_prefix: The single-line comment character(s) for the
-                            target language (e.g. "#" for Python/Ruby,
-                            "//" for JS/Java/Go/Rust/C).
-        """
-        p = comment_prefix
+    def to_comment_block(self) -> str:
+        """Generate the <SEARCH_META> comment block (Python format)."""
         tags_str = ", ".join(f"#{tag}" for tag in self.tags)
         return (
-            f"{p} <SEARCH_META v{self.version}>\n"
-            f"{p} CYPHER: {self.cypher}\n"
-            f"{p} SIG: {self.signature}\n"
-            f"{p} TAGS: {tags_str}\n"
-            f"{p} COMPLEXITY: {self.complexity}\n"
-            f"{p} </SEARCH_META>\n"
+            f"# <SEARCH_META v{self.version}>\n"
+            f"# CYPHER: {self.cypher}\n"
+            f"# SIG: {self.signature}\n"
+            f"# TAGS: {tags_str}\n"
+            f"# COMPLEXITY: {self.complexity}\n"
+            f"# </SEARCH_META>\n"
         )
     
     @staticmethod
     def parse_from_code(code: str) -> Optional['CypherMeta']:
-        """
-        Extract existing SEARCH_META from code.
-        
-        Handles any single-line comment prefix (# or //).
-        """
-        # Match both # and // prefixed SEARCH_META blocks
-        pattern = r'(?:#|//)\s*<SEARCH_META.*?>(.*?)(?:#|//)\s*</SEARCH_META>'
+        """Extract existing SEARCH_META from Python code."""
+        pattern = r'#\s*<SEARCH_META.*?>(.*?)#\s*</SEARCH_META>'
         match = re.search(pattern, code, re.DOTALL)
         if not match:
             return None
         
         content = match.group(1)
-        cypher = re.search(r'(?:#|//)\s*CYPHER:\s*(.*)', content)
-        tags = re.search(r'(?:#|//)\s*TAGS:\s*(.*)', content)
-        sig = re.search(r'(?:#|//)\s*SIG:\s*(.*)', content)
-        comp = re.search(r'(?:#|//)\s*COMPLEXITY:\s*(.*)', content)
+        cypher = re.search(r'#\s*CYPHER:\s*(.*)', content)
+        tags = re.search(r'#\s*TAGS:\s*(.*)', content)
+        sig = re.search(r'#\s*SIG:\s*(.*)', content)
+        comp = re.search(r'#\s*COMPLEXITY:\s*(.*)', content)
         
         if cypher:
             return CypherMeta(
@@ -132,10 +119,10 @@ class SearchResult:
 
 class CodeAnalyzer:
     """
-    Language-agnostic code analyzer.
+    Python code analyzer using AST-based extraction.
     
-    Uses Python's ``ast`` module for .py files (most accurate) and falls
-    back to regex-based extraction for every other supported language.
+    Uses Python's built-in ``ast`` module for precise function metadata
+    extraction with full support for nested functions, decorators, and edge cases.
     """
 
     # ── Public API ───────────────────────────────────────────────
@@ -143,23 +130,10 @@ class CodeAnalyzer:
     @staticmethod
     def extract_functions(source_code: str, file_path: str = "<string>") -> List[FunctionMetadata]:
         """
-        Extract all function / method definitions from *source_code*.
+        Extract all function / method definitions from Python source code.
         
-        Automatically picks the best extraction strategy based on the
-        file extension (AST for Python, regex for everything else).
+        Uses Python's AST module for accurate, robust extraction.
         """
-        lang = LanguageRegistry.detect_language(file_path)
-
-        # Python → precise AST-based extraction
-        if lang and lang["name"] == "Python":
-            return CodeAnalyzer._extract_python_ast(source_code, file_path)
-
-        # Every other registered language → regex-based extraction
-        if lang:
-            return CodeAnalyzer._extract_regex(source_code, file_path, lang)
-
-        # Unrecognised extension — try Python AST as last resort
-        logger.warning(f"Unknown language for {file_path}; attempting Python AST parse")
         return CodeAnalyzer._extract_python_ast(source_code, file_path)
 
     @staticmethod
@@ -245,115 +219,14 @@ class CodeAnalyzer:
             language="Python",
         )
 
-    # ── Regex-based extraction (all other languages) ─────────────
-
-    @staticmethod
-    def _extract_regex(source_code: str, file_path: str, lang: dict) -> List[FunctionMetadata]:
-        """
-        Extract functions from source code using language-specific regex
-        patterns from the ``LanguageRegistry``.
-        
-        For brace-delimited languages the function body end is determined
-        by counting matching ``{`` / ``}`` pairs.  For indent-based or
-        keyword-based languages (Ruby ``end``) a heuristic is used.
-        """
-        # Control-flow / language keywords that regex patterns may
-        # accidentally capture as function names.  Checked before any
-        # expensive processing or LLM calls.
-        _KEYWORD_REJECT = frozenset({
-            "if", "else", "elif", "for", "while", "do", "switch",
-            "case", "catch", "try", "finally", "throw", "return",
-            "new", "delete", "typeof", "instanceof", "void", "await",
-            "sizeof", "alignof", "decltype", "goto", "break",
-            "continue", "import", "from", "class", "struct", "enum",
-            "interface", "namespace", "module", "package", "with",
-        })
-
-        functions: List[FunctionMetadata] = []
-        lines = source_code.splitlines()
-
-        for pattern in lang["function_patterns"]:
-            for match in pattern.finditer(source_code):
-                name = match.group("name")
-
-                # Fast reject: skip control-flow keywords that slipped
-                # past regex patterns (defense-in-depth).
-                if name in _KEYWORD_REJECT:
-                    continue
-
-                # Determine start line (1-indexed)
-                start_offset = match.start()
-                start_line = source_code[:start_offset].count("\n") + 1
-
-                # Parse argument list
-                raw_args = match.group("args") if "args" in match.groupdict() else ""
-                args = CodeAnalyzer._parse_args(raw_args)
-
-                # Determine if async
-                is_async = bool(match.groupdict().get("async"))
-
-                # Determine end line
-                end_line = CodeAnalyzer._find_function_end(
-                    lines, start_line, lang
-                )
-
-                # Extract function body for basic metrics
-                body_text = "\n".join(lines[start_line - 1:end_line])
-
-                # Approximate calls — look for identifier( patterns
-                call_pattern = re.compile(r'\b(\w+)\s*\(')
-                raw_calls = call_pattern.findall(body_text)
-                # Filter out language keywords that look like calls
-                keyword_exclude = {
-                    "if", "for", "while", "switch", "catch", "return",
-                    "sizeof", "typeof", "instanceof", "new", "throw",
-                    "await", name,  # exclude self-call
-                }
-                calls = list({c for c in raw_calls if c not in keyword_exclude})[:10]
-
-                # Approximate cyclomatic complexity from branch keywords
-                branch_keywords = re.compile(
-                    r'\b(?:if|else if|elif|for|while|catch|except|case|switch)\b'
-                )
-                complexity = len(branch_keywords.findall(body_text)) + 1
-
-                # Attempt to extract a leading doc-comment
-                docstring = CodeAnalyzer._extract_doc_comment(lines, start_line, lang)
-
-                functions.append(FunctionMetadata(
-                    name=name,
-                    start_line=start_line,
-                    end_line=end_line,
-                    is_async=is_async,
-                    args=args,
-                    calls=calls,
-                    imports=[],
-                    docstring=docstring,
-                    complexity=complexity,
-                    language=lang["name"],
-                ))
-
-        # De-duplicate by (name, start_line) — multiple patterns may
-        # match the same function definition.
-        seen: set = set()
-        unique: List[FunctionMetadata] = []
-        for fn in functions:
-            key = (fn.name, fn.start_line)
-            if key not in seen:
-                seen.add(key)
-                unique.append(fn)
-
-        return unique
-
     # ── Helpers ───────────────────────────────────────────────────
 
     @staticmethod
     def _parse_args(raw_args: str) -> List[str]:
         """
-        Parse a raw argument string into a list of parameter names.
+        Parse a raw Python argument string into a list of parameter names.
         
-        Strips type annotations, default values, and language-specific
-        qualifiers (e.g. Java ``final``, Go types, Rust patterns).
+        Strips type annotations and default values.
         """
         if not raw_args or not raw_args.strip():
             return []
@@ -365,140 +238,11 @@ class CodeAnalyzer:
                 continue
             # Remove default value (= ...)
             part = part.split("=")[0].strip()
-            # Remove type annotation after ':'  (Python, TS, Kotlin)
+            # Remove type annotation after ':'  (Python)
             part = part.split(":")[0].strip()
-            # For Go / Java / C-family — take the last word token as the name
-            tokens = part.split()
-            if tokens:
-                # Skip pure type-only entries (e.g. variadic "...")
-                name_candidate = tokens[-1].strip("*&")
-                if name_candidate and name_candidate.isidentifier():
-                    args.append(name_candidate)
+            if part and part.isidentifier():
+                args.append(part)
         return args
-
-    @staticmethod
-    def _find_function_end(lines: List[str], start_line: int,
-                           lang: dict) -> int:
-        """
-        Determine the end line of a function body.
-        
-        Strategy by language type:
-          - *Brace-delimited* (JS, Java, Go, C, Rust …):  count ``{`` / ``}``
-            starting from the function declaration line.
-          - *Indent-based* (Python): handled by AST; this is a fallback that
-            walks lines while indentation stays deeper than the def line.
-          - *Ruby*: look for a matching ``end`` keyword.
-        """
-        total_lines = len(lines)
-
-        if lang.get("uses_braces"):
-            # Find the opening brace first (may be on the same line or the next)
-            depth = 0
-            found_open = False
-            for i in range(start_line - 1, min(start_line + 2, total_lines)):
-                for ch in lines[i]:
-                    if ch == '{':
-                        depth += 1
-                        found_open = True
-                    elif ch == '}':
-                        depth -= 1
-                if found_open and depth == 0:
-                    return i + 1  # 1-indexed
-
-            # Continue counting from where we left off
-            for i in range(start_line + 2, total_lines):
-                for ch in lines[i]:
-                    if ch == '{':
-                        depth += 1
-                        found_open = True
-                    elif ch == '}':
-                        depth -= 1
-                if found_open and depth == 0:
-                    return i + 1
-            # Couldn't balance braces — return a reasonable chunk
-            return min(start_line + 50, total_lines)
-
-        elif lang.get("uses_indent"):
-            # Indent-based (Python fallback when AST is unavailable)
-            if start_line - 1 >= total_lines:
-                return start_line
-            base_indent = len(lines[start_line - 1]) - len(lines[start_line - 1].lstrip())
-            for i in range(start_line, total_lines):
-                stripped = lines[i].strip()
-                if not stripped:
-                    continue  # skip blank lines
-                current_indent = len(lines[i]) - len(lines[i].lstrip())
-                if current_indent <= base_indent and stripped:
-                    return i  # 1-indexed (previous line was the last)
-            return total_lines
-
-        else:
-            # Ruby-style: scan for matching 'end' keyword
-            depth = 1
-            block_openers = re.compile(r'\b(?:def|do|class|module|if|unless|while|until|for|case|begin)\b')
-            for i in range(start_line, total_lines):
-                line_stripped = lines[i].strip()
-                depth += len(block_openers.findall(lines[i]))
-                if line_stripped == "end" or line_stripped.startswith("end "):
-                    depth -= 1
-                if depth <= 0:
-                    return i + 1
-            return min(start_line + 50, total_lines)
-
-    @staticmethod
-    def _extract_doc_comment(lines: List[str], start_line: int,
-                             lang: dict) -> Optional[str]:
-        """
-        Look for a documentation comment immediately above the function
-        definition (JSDoc-style ``/** */``, Python docstrings are handled
-        by AST, ``///`` Rust doc-comments, ``#`` Ruby comments, etc.).
-        """
-        comment_lines: List[str] = []
-        prefix = lang.get("comment_single", "//")
-        block = lang.get("comment_block")
-
-        # Walk backwards from the line before the function definition
-        for i in range(start_line - 2, max(0, start_line - 20) - 1, -1):
-            if i >= len(lines):
-                continue
-            stripped = lines[i].strip()
-            if not stripped:
-                # One blank line is okay; stop at two consecutive blanks
-                if comment_lines:
-                    break
-                continue
-
-            # Single-line comment (// or #)
-            if stripped.startswith(prefix):
-                comment_lines.insert(0, stripped.lstrip(prefix).strip())
-                continue
-
-            # Block comment closing (e.g. */)
-            if block and stripped.endswith(block[1]):
-                # Collect the whole block upward
-                comment_lines.insert(0, stripped)
-                for j in range(i - 1, max(0, i - 30) - 1, -1):
-                    s2 = lines[j].strip()
-                    comment_lines.insert(0, s2)
-                    if block[0] in s2:
-                        break
-                break
-
-            # Non-comment line — stop
-            break
-
-        if not comment_lines:
-            return None
-
-        # Clean block comment markers
-        text = "\n".join(comment_lines)
-        if block:
-            text = text.replace(block[0], "").replace(block[1], "")
-        # Strip leading * (JSDoc style)
-        cleaned = "\n".join(
-            line.lstrip("* ").rstrip() for line in text.splitlines()
-        ).strip()
-        return cleaned or None
 
 
 # =============================================================================
@@ -619,7 +363,34 @@ class CypherCache:
             """, (f"%{tag}%", limit))
             
             return [dict(row) for row in cursor.fetchall()]
-    
+
+    def search_by_name(self, keywords: List[str], limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Search for functions whose name contains any of the given keywords.
+
+        Uses SQL LIKE with wildcard wrapping so ``delete`` matches
+        ``_delete_directory_tree_and_relations``.  The function_name column
+        is already indexed (``idx_function_name``) for fast lookups.
+        """
+        if not keywords:
+            return []
+
+        # Build OR-chained LIKE conditions (one per keyword)
+        conditions = " OR ".join(["function_name LIKE ?"] * len(keywords))
+        params: list = [f"%{kw}%" for kw in keywords]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(f"""
+                SELECT file_path, function_name, line_start, line_end,
+                       cypher, tags, signature
+                FROM cypher_index
+                WHERE {conditions}
+                ORDER BY indexed_at DESC
+                LIMIT ?
+            """, params + [limit])
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_stats(self) -> Dict[str, int]:
         """Get indexing statistics."""
         with sqlite3.connect(self.db_path) as conn:
@@ -804,7 +575,7 @@ class CypherGenerator:
 
     def generate_cypher(self, function_code: str, metadata: FunctionMetadata) -> Optional[str]:
         """
-        Generate a Cypher string for a function.
+        Generate a Cypher string for a Python function.
 
         Returns ``None`` when the LLM determines the code is not a
         classifiable function (SKIP response) or consistently returns
@@ -815,15 +586,12 @@ class CypherGenerator:
         generator after all attempts are exhausted.
         """
         import time
-        language = metadata.language or "Python"
         for attempt in range(1, Config.RETRY_ATTEMPTS + 1):
             try:
                 cypher = self.llm.complete(
                     system=Prompts.CYPHER_GENERATION_SYSTEM,
                     user_message=Prompts.CYPHER_GENERATION_USER.format(
                         code=function_code,
-                        language=language,
-                        language_lower=language.lower(),
                     ),
                 )
 
@@ -1003,12 +771,11 @@ class CypherGenerator:
 
 def scan_directory(root_path: Path) -> List[Path]:
     """
-    Recursively scan for source files in all supported languages.
+    Recursively scan for Python source files (.py).
 
     Uses :func:`os.walk` with **early directory pruning** so that
-    excluded subtrees (e.g. ``.git/``, ``node_modules/``) are never
-    entered — a significant speedup on large repositories compared to
-    ``Path.rglob("*")``.
+    excluded subtrees (e.g. ``.git/``, ``__pycache__/``) are never
+    entered — a significant speedup on large repositories.
 
     Respects ``Config.TARGET_EXTENSIONS`` and ``Config.EXCLUDE_DIRS``.
     """
@@ -1101,13 +868,8 @@ def calculate_search_score(
     score = 0.0
     weights = Config.SEARCH_RANKING_WEIGHTS
     
-    # ── Stop-words to ignore when matching query words ──
-    stop_words = {
-        "i", "a", "the", "is", "it", "do", "we", "my", "me", "an", "in",
-        "to", "for", "of", "and", "or", "on", "at", "by", "with", "from",
-        "that", "this", "where", "what", "how", "which", "show", "find",
-        "search", "look", "give", "list", "get", "see", "main",
-    }
+    # Use centralized stop words from Config
+    stop_words = Config.STOP_WORDS
     
     pattern_parts = cypher_pattern.split(':')
     result_parts = result_cypher.split(':')
@@ -1162,10 +924,23 @@ def calculate_search_score(
     )
     score += matching_tags * weights["tag_match"]
     
-    # Function name relevance — split snake_case and check overlap
+    # Function name relevance — exact word overlap + substring matching.
+    # Exact:     "delete" in query matches "delete" in snake_case parts.
+    # Substring: "deletion" in query → "delete" found as substring inside
+    #            the full function name, scoring at 70 % of exact weight.
     if function_name and query_words:
-        name_parts = set(function_name.lower().replace("_", " ").split())
-        name_hits = len(query_words & name_parts)
-        score += name_hits * weights.get("name_match", 1.5)
-    
+        name_lower = function_name.lower()
+        name_parts = set(name_lower.replace("_", " ").split())
+
+        # Exact word overlap (highest confidence)
+        exact_hits = len(query_words & name_parts)
+
+        # Substring overlap for remaining words
+        remaining = query_words - name_parts
+        substr_hits = sum(
+            1 for qw in remaining if qw in name_lower
+        )
+
+        score += (exact_hits + substr_hits * 0.7) * weights.get("name_match", 3.0)
+
     return score

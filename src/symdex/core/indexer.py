@@ -1,7 +1,7 @@
 """
 Symdex-100 Batch Indexer
 
-Crawls directories, analyzes source code in any supported language,
+Crawls directories, analyzes Python source code using AST,
 generates Cypher metadata using LLM, and stores everything in a
 sidecar SQLite index (``.symdex/index.db``).
 
@@ -10,7 +10,7 @@ sidecar SQLite index (``.symdex/index.db``).
 developers never see unwanted comment blocks in their diffs.
 
 Production-ready with:
-- Language-agnostic function extraction (AST for Python, regex for others)
+- Python AST-based function extraction (precise, robust)
 - Incremental indexing (only processes changed files)
 - Concurrent processing with rate limiting
 - Comprehensive error handling and logging
@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
 
-from symdex.core.config import Config, LanguageRegistry
+from symdex.core.config import Config
 from symdex.core.engine import (
     CodeAnalyzer, CypherCache, CypherGenerator,
     FunctionMetadata, scan_directory
@@ -168,7 +168,7 @@ class IndexingPipeline:
         self._print_statistics()
 
     def _process_file(self, file_path: Path) -> bool:
-        """Process a single source file (any supported language)."""
+        """Process a single Python source file."""
         try:
             source_code = file_path.read_text(encoding='utf-8')
 
@@ -348,7 +348,7 @@ class IndexingPipeline:
 def main():
     """Legacy entry point for the indexer."""
     parser = argparse.ArgumentParser(
-        description="Symdex-100 Batch Indexer — generate a sidecar search index for source code (any language)",
+        description="Symdex-100 Batch Indexer — generate a sidecar search index for Python source code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

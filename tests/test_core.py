@@ -67,241 +67,6 @@ class TestCodeAnalyzerPython:
 
 
 # =============================================================================
-# CodeAnalyzer — JavaScript regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerJavaScript:
-    """JavaScript function extraction via regex patterns."""
-
-    def test_extract_function_declaration(self, javascript_source):
-        funcs = CodeAnalyzer.extract_functions(javascript_source, "utils.js")
-        names = [f.name for f in funcs]
-        assert "validateToken" in names
-
-    def test_extract_arrow_function(self, javascript_source):
-        funcs = CodeAnalyzer.extract_functions(javascript_source, "utils.js")
-        names = [f.name for f in funcs]
-        assert "fetchData" in names
-
-    def test_async_detected_for_arrow(self, javascript_source):
-        funcs = CodeAnalyzer.extract_functions(javascript_source, "utils.js")
-        fetch = next((f for f in funcs if f.name == "fetchData"), None)
-        assert fetch is not None
-        assert fetch.is_async is True
-
-    def test_language_field_set(self, javascript_source):
-        funcs = CodeAnalyzer.extract_functions(javascript_source, "utils.js")
-        for f in funcs:
-            assert f.language == "JavaScript"
-
-    def test_args_extracted(self, javascript_source):
-        funcs = CodeAnalyzer.extract_functions(javascript_source, "utils.js")
-        validate = next(f for f in funcs if f.name == "validateToken")
-        assert "token" in validate.args
-
-    def test_control_flow_keywords_not_extracted(self):
-        """Ensure if/for/while/switch inside JS are not detected as functions."""
-        js_code = (
-            "class Service {\n"
-            "    handleRequest(req) {\n"
-            "        if (req.valid) {\n"
-            "            console.log('ok');\n"
-            "        }\n"
-            "        for (let i = 0; i < 10; i++) {\n"
-            "            process(i);\n"
-            "        }\n"
-            "        while (pending) {\n"
-            "            await sleep(100);\n"
-            "        }\n"
-            "        switch (req.type) {\n"
-            "            case 'a': break;\n"
-            "        }\n"
-            "    }\n"
-            "}\n"
-        )
-        funcs = CodeAnalyzer.extract_functions(js_code, "service.js")
-        names = [f.name for f in funcs]
-        assert "handleRequest" in names
-        for kw in ("if", "for", "while", "switch"):
-            assert kw not in names, f"'{kw}' should not be extracted as a function"
-
-
-# =============================================================================
-# CodeAnalyzer — TypeScript regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerTypeScript:
-    """TypeScript function extraction."""
-
-    def test_extract_async_function(self, typescript_source):
-        funcs = CodeAnalyzer.extract_functions(typescript_source, "service.ts")
-        names = [f.name for f in funcs]
-        assert "getUserById" in names
-
-    def test_extract_arrow_function(self, typescript_source):
-        funcs = CodeAnalyzer.extract_functions(typescript_source, "service.ts")
-        names = [f.name for f in funcs]
-        assert "transformPayload" in names
-
-    def test_language_is_typescript(self, typescript_source):
-        funcs = CodeAnalyzer.extract_functions(typescript_source, "service.ts")
-        for f in funcs:
-            assert f.language == "TypeScript"
-
-    def test_control_flow_keywords_not_extracted(self):
-        """Ensure if/for/while inside TS are not detected as functions."""
-        ts_code = (
-            "class Controller {\n"
-            "    public async handle(req: Request): Promise<void> {\n"
-            "        if (req.isValid()) {\n"
-            "            await this.process(req);\n"
-            "        }\n"
-            "        for (const item of req.items) {\n"
-            "            this.store(item);\n"
-            "        }\n"
-            "        while (this.pending) {\n"
-            "            await this.wait();\n"
-            "        }\n"
-            "    }\n"
-            "}\n"
-        )
-        funcs = CodeAnalyzer.extract_functions(ts_code, "controller.ts")
-        names = [f.name for f in funcs]
-        assert "handle" in names
-        for kw in ("if", "for", "while"):
-            assert kw not in names, f"'{kw}' should not be extracted as a function"
-
-
-# =============================================================================
-# CodeAnalyzer — Java regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerJava:
-    """Java method extraction."""
-
-    def test_extract_public_static_method(self, java_source):
-        funcs = CodeAnalyzer.extract_functions(java_source, "UserService.java")
-        names = [f.name for f in funcs]
-        assert "fetchUser" in names
-
-    def test_extract_private_method(self, java_source):
-        funcs = CodeAnalyzer.extract_functions(java_source, "UserService.java")
-        names = [f.name for f in funcs]
-        assert "deleteUser" in names
-
-    def test_language_is_java(self, java_source):
-        funcs = CodeAnalyzer.extract_functions(java_source, "UserService.java")
-        for f in funcs:
-            assert f.language == "Java"
-
-
-# =============================================================================
-# CodeAnalyzer — Go regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerGo:
-    """Go function and receiver method extraction."""
-
-    def test_extract_standalone_function(self, go_source):
-        funcs = CodeAnalyzer.extract_functions(go_source, "main.go")
-        names = [f.name for f in funcs]
-        assert "FetchRecords" in names
-
-    def test_extract_receiver_method(self, go_source):
-        funcs = CodeAnalyzer.extract_functions(go_source, "main.go")
-        names = [f.name for f in funcs]
-        assert "HandleRequest" in names
-
-    def test_doc_comment_extracted(self, go_source):
-        funcs = CodeAnalyzer.extract_functions(go_source, "main.go")
-        fetch = next(f for f in funcs if f.name == "FetchRecords")
-        assert fetch.docstring is not None
-        assert "records" in fetch.docstring.lower()
-
-
-# =============================================================================
-# CodeAnalyzer — Rust regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerRust:
-    """Rust function extraction."""
-
-    def test_extract_pub_fn(self, rust_source):
-        funcs = CodeAnalyzer.extract_functions(rust_source, "lib.rs")
-        names = [f.name for f in funcs]
-        assert "validate_input" in names
-
-    def test_extract_pub_async_fn(self, rust_source):
-        funcs = CodeAnalyzer.extract_functions(rust_source, "lib.rs")
-        send = next(f for f in funcs if f.name == "send_notification")
-        assert send.is_async is True
-
-    def test_language_is_rust(self, rust_source):
-        funcs = CodeAnalyzer.extract_functions(rust_source, "lib.rs")
-        for f in funcs:
-            assert f.language == "Rust"
-
-
-# =============================================================================
-# CodeAnalyzer — Ruby regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerRuby:
-    """Ruby method extraction."""
-
-    def test_extract_instance_method(self, ruby_source):
-        funcs = CodeAnalyzer.extract_functions(ruby_source, "user_service.rb")
-        names = [f.name for f in funcs]
-        assert "create_user" in names
-
-    def test_extract_class_method(self, ruby_source):
-        funcs = CodeAnalyzer.extract_functions(ruby_source, "user_service.rb")
-        names = [f.name for f in funcs]
-        assert "find_user" in names
-
-    def test_language_is_ruby(self, ruby_source):
-        funcs = CodeAnalyzer.extract_functions(ruby_source, "user_service.rb")
-        for f in funcs:
-            assert f.language == "Ruby"
-
-
-# =============================================================================
-# CodeAnalyzer — C++ regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerCpp:
-    """C++ function extraction."""
-
-    def test_extract_function(self, cpp_source):
-        funcs = CodeAnalyzer.extract_functions(cpp_source, "parser.cpp")
-        names = [f.name for f in funcs]
-        assert "parseCsv" in names
-
-    def test_language_is_cpp(self, cpp_source):
-        funcs = CodeAnalyzer.extract_functions(cpp_source, "parser.cpp")
-        for f in funcs:
-            assert f.language == "C++"
-
-
-# =============================================================================
-# CodeAnalyzer — C# regex extraction
-# =============================================================================
-
-class TestCodeAnalyzerCSharp:
-    """C# method extraction."""
-
-    def test_extract_async_method(self, csharp_source):
-        funcs = CodeAnalyzer.extract_functions(csharp_source, "OrderController.cs")
-        names = [f.name for f in funcs]
-        assert "CreateOrder" in names
-
-    def test_language_is_csharp(self, csharp_source):
-        funcs = CodeAnalyzer.extract_functions(csharp_source, "OrderController.cs")
-        for f in funcs:
-            assert f.language == "C#"
-
-
-# =============================================================================
 # CodeAnalyzer — Shared helpers
 # =============================================================================
 
@@ -326,7 +91,7 @@ class TestCodeAnalyzerHelpers:
         meta = FunctionMetadata(
             name="foo", start_line=1, end_line=5, is_async=False,
             args=[], calls=[], imports=[], docstring=None,
-            complexity=1, language="Go",
+            complexity=1, language="Python",
         )
         sig = CodeAnalyzer.generate_signature(meta)
         assert "void" in sig
@@ -359,17 +124,11 @@ class TestCypherMeta:
         )
 
     def test_to_comment_block_python(self):
-        block = self._make_meta().to_comment_block(comment_prefix="#")
+        block = self._make_meta().to_comment_block()
         assert block.startswith("# <SEARCH_META")
         assert "# CYPHER: SEC:VAL_TOKEN--SYN" in block
         assert "# TAGS:" in block
         assert "# </SEARCH_META>" in block
-
-    def test_to_comment_block_js(self):
-        block = self._make_meta().to_comment_block(comment_prefix="//")
-        assert block.startswith("// <SEARCH_META")
-        assert "// CYPHER: SEC:VAL_TOKEN--SYN" in block
-        assert "// </SEARCH_META>" in block
 
     def test_parse_from_python_code(self):
         code = (
@@ -387,22 +146,6 @@ class TestCypherMeta:
         assert meta.cypher == "DAT:FET_USER--SYN"
         assert "data" in meta.tags
         assert "fetch" in meta.tags
-
-    def test_parse_from_js_code(self):
-        code = (
-            "// <SEARCH_META v1.0>\n"
-            "// CYPHER: NET:FET_DATA--ASY\n"
-            "// SIG: [url] → Promise\n"
-            "// TAGS: #network, #async\n"
-            "// COMPLEXITY: O(1)\n"
-            "// </SEARCH_META>\n"
-            "async function fetchData(url) {\n"
-            "    return await fetch(url);\n"
-            "}\n"
-        )
-        meta = CypherMeta.parse_from_code(code)
-        assert meta is not None
-        assert meta.cypher == "NET:FET_DATA--ASY"
 
     def test_parse_returns_none_when_no_meta(self):
         code = "def plain_function():\n    pass\n"
@@ -547,7 +290,7 @@ class TestCypherGeneratorValidation:
         meta = FunctionMetadata(
             name="send_message", start_line=1, end_line=5,
             is_async=True, args=["msg"], calls=[], imports=[],
-            docstring=None, complexity=1, language="JavaScript",
+            docstring=None, complexity=1, language="Python",
         )
         cypher = CypherGenerator._generate_fallback_cypher(meta)
         assert cypher.endswith("--ASY")
@@ -641,7 +384,7 @@ class TestLLMProviderAbstraction:
         meta = FunctionMetadata(
             name="fetch_user", start_line=1, end_line=5,
             is_async=True, args=["uid"], calls=[], imports=[],
-            docstring=None, complexity=1, language="TypeScript",
+            docstring=None, complexity=1, language="Python",
         )
         result = gen.generate_cypher("async function fetchUser(uid) {...}", meta)
         assert result == "DAT:FET_USER--ASY"
@@ -649,7 +392,7 @@ class TestLLMProviderAbstraction:
 
 
 # =============================================================================
-# scan_directory — multi-language file scanning
+# scan_directory — Python file scanning
 # =============================================================================
 
 class TestScanDirectory:
@@ -660,20 +403,10 @@ class TestScanDirectory:
         py_files = [f for f in files if f.suffix == ".py"]
         assert len(py_files) >= 1
 
-    def test_finds_javascript_files(self, tmp_project):
-        files = scan_directory(tmp_project)
-        js_files = [f for f in files if f.suffix == ".js"]
-        assert len(js_files) >= 1
-
-    def test_finds_go_files(self, tmp_project):
-        files = scan_directory(tmp_project)
-        go_files = [f for f in files if f.suffix == ".go"]
-        assert len(go_files) >= 1
-
-    def test_excludes_node_modules(self, tmp_project):
+    def test_excludes_pycache(self, tmp_project):
         files = scan_directory(tmp_project)
         for f in files:
-            assert "node_modules" not in f.parts
+            assert "__pycache__" not in f.parts
 
     def test_returns_sorted_paths(self, tmp_project):
         files = scan_directory(tmp_project)

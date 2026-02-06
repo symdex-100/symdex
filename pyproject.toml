@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "symdex-100"
 version = "1.0.0"
-description = "Inline semantic fingerprints for 100x faster code search. Language-agnostic Cypher metadata embedded directly into source files."
+description = "Semantic fingerprints for 100x faster code search. Python-focused Cypher metadata stored in sidecar index."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

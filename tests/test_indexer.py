@@ -16,7 +16,7 @@ from symdex.core.indexer import IndexingPipeline
 # =============================================================================
 
 class TestTagGeneration:
-    """Tags should be generated from function metadata regardless of language.
+    """Tags should be generated from function metadata.
 
     ``_generate_tags`` is a static method on ``IndexingPipeline`` so we
     can call it directly without instantiating the pipeline (which would
@@ -38,7 +38,7 @@ class TestTagGeneration:
         meta = FunctionMetadata(
             name="send_message", start_line=1, end_line=5,
             is_async=True, args=["msg"], calls=[], imports=[],
-            docstring=None, complexity=1, language="TypeScript",
+            docstring=None, complexity=1, language="Python",
         )
         tags = IndexingPipeline._generate_tags(meta)
         assert "async" in tags
@@ -47,7 +47,7 @@ class TestTagGeneration:
         meta = FunctionMetadata(
             name="process", start_line=1, end_line=10,
             is_async=False, args=[], calls=["validate", "serialize", "log"],
-            imports=[], docstring=None, complexity=1, language="Java",
+            imports=[], docstring=None, complexity=1, language="Python",
         )
         tags = IndexingPipeline._generate_tags(meta)
         assert "validate" in tags
@@ -58,7 +58,7 @@ class TestTagGeneration:
             name="handle", start_line=1, end_line=10,
             is_async=False, args=[], calls=[], imports=[],
             docstring="Handle authentication and authorization for API requests.",
-            complexity=1, language="Go",
+            complexity=1, language="Python",
         )
         tags = IndexingPipeline._generate_tags(meta)
         assert "authentication" in tags or "authorization" in tags
@@ -74,7 +74,7 @@ class TestTagGeneration:
             imports=[],
             docstring="security performance cache database api network file stream",
             complexity=10,
-            language="Rust",
+            language="Python",
         )
         tags = IndexingPipeline._generate_tags(meta)
         assert len(tags) <= 12

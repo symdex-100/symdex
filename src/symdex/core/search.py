@@ -36,66 +36,79 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class CypherSearchEngine:
-    """High-performance search engine for Cypher-indexed code."""
-    
+    """
+    Multi-lane search engine for Cypher-indexed code.
+
+    Instead of relying on a single Cypher pattern (which can miss relevant
+    results in adjacent domains), the engine always runs **five** parallel
+    retrieval lanes and merges their output before a unified scoring pass:
+
+    1. **Exact Cypher** — high-precision hit from the LLM-translated pattern
+    2. **Domain-wildcarded Cypher** — same ACT_OBJ, any domain
+    3. **Action-only Cypher** — same ACT, any OBJ/PAT/domain
+    4. **Tag keywords** — query words matched against function tags
+    5. **Function name** — query words matched inside function names
+
+    Results are deduplicated, scored, and ranked so that exact matches
+    still win, but cross-domain and name-based results are surfaced too.
+    """
+
+    # Words stripped from queries before keyword / name / tag matching
+    # (imported from Config to avoid duplication)
+
     def __init__(self, cache_dir: Path):
         self.cache = CypherCache(Config.get_cache_path(cache_dir))
         self.generator = CypherGenerator()
-    
-    def search(self, query: str, strategy: str = "auto", 
+
+    # ── Public API ────────────────────────────────────────────────
+
+    def search(self, query: str, strategy: str = "auto",
                max_results: int = None) -> List[SearchResult]:
         """
         Execute a search query using the specified strategy.
-        
+
         Args:
-            query: Natural language search query or Cypher pattern
-            strategy: Search strategy ('auto', 'llm', 'keyword', 'direct')
-            max_results: Maximum number of results to return
-        
+            query: Natural language search query or Cypher pattern.
+            strategy: Search strategy ('auto', 'llm', 'keyword', 'direct').
+            max_results: Maximum number of results to return.
+
         Returns:
-            Ranked list of search results
+            Ranked list of search results.
         """
         max_results = max_results or Config.MAX_SEARCH_RESULTS
-        
-        # Determine if query is already a Cypher pattern
+
+        # Determine Cypher pattern from the query
         if self._is_cypher_pattern(query):
             cypher_pattern = query
             logger.info(f"Direct Cypher search: {cypher_pattern}")
         else:
-            # Translate natural language to Cypher
-            if strategy == "llm" or strategy == "auto":
+            if strategy in ("llm", "auto"):
                 cypher_pattern = self._translate_with_llm(query)
             else:
                 cypher_pattern = self._translate_with_keywords(query)
-            
             logger.info(f"Query: '{query}' → Cypher: '{cypher_pattern}'")
-        
-        # Execute search
-        raw_results = self.cache.search_by_cypher(cypher_pattern, limit=max_results * 2)
-        
-        # If no results, try progressively broader searches
-        if not raw_results:
-            raw_results = self._fallback_search(query, cypher_pattern)
-        
-        # Convert to SearchResult objects and rank
+
+        # Always-on multi-lane retrieval
+        raw_results = self._multi_lane_search(query, cypher_pattern, max_results)
+
+        # Score, rank, limit
         search_results = self._process_results(raw_results, cypher_pattern, query)
-        
-        # Sort by score and limit
         search_results.sort()
         return search_results[:max_results]
-    
+
     def search_by_tag(self, tag: str, max_results: int = None) -> List[SearchResult]:
         """Search for functions by tag."""
         max_results = max_results or Config.MAX_SEARCH_RESULTS
         raw_results = self.cache.search_by_tags(tag, limit=max_results)
         return self._process_results(raw_results, None, tag)
-    
+
+    # ── Query analysis helpers ────────────────────────────────────
+
     def _is_cypher_pattern(self, query: str) -> bool:
         """Check if query is already in Cypher format."""
-        # 2-3 char DOM, 3 char ACT, 2-20 char OBJ (letters/digits), 3 char PAT
         pattern = r'^[A-Z*]{2,3}:[A-Z*]{3}_[A-Z0-9*]{2,20}--[A-Z*]{3}$'
         return bool(re.match(pattern, query.strip()))
-    
+
     def _translate_with_llm(self, query: str) -> str:
         """Translate natural language query to Cypher using LLM."""
         try:
@@ -103,120 +116,133 @@ class CypherSearchEngine:
         except Exception as e:
             logger.warning(f"LLM translation failed: {e}. Falling back to keywords.")
             return self._translate_with_keywords(query)
-    
+
     def _translate_with_keywords(self, query: str) -> str:
         """Translate query using keyword matching (fast fallback)."""
         query_lower = query.lower()
-        
-        # Find domain
+
         dom = "*"
         for keyword, code in CypherSchema.KEYWORD_TO_DOMAIN.items():
             if keyword in query_lower:
                 dom = code
                 break
-        
-        # Find action
+
         act = "*"
         for keyword, code in CypherSchema.KEYWORD_TO_ACTION.items():
             if keyword in query_lower:
                 act = code
                 break
-        
-        # Find pattern
+
         pat = "*"
         for keyword, code in CypherSchema.KEYWORD_TO_PATTERN.items():
             if keyword in query_lower:
                 pat = code
                 break
-        
-        # Extract potential object
+
         obj = "*"
-        # Look for capitalized words or quoted strings
         obj_matches = re.findall(r'\b[A-Z][a-z]+\b|"([^"]+)"', query)
         if obj_matches:
-            obj_word = obj_matches[0] if isinstance(obj_matches[0], str) else obj_matches[0][0]
-            obj = obj_word[:4].upper().ljust(4, '*')
-        
-        return f"{dom}:{act}_{obj}--{pat}"
-    
-    def _fallback_search(self, query: str, original_pattern: str) -> List[Dict[str, Any]]:
-        """
-        Perform progressively broader searches if initial search fails.
-        Also runs a parallel tag-based search and merges unique results.
-        """
-        logger.info("No results found. Attempting fallback searches...")
-        
-        # ── Parallel tag search ──────────────────────────────────
-        # Extract meaningful words from query to search by tags
-        stop_words = {
-            "i", "a", "the", "is", "it", "do", "we", "my", "me", "an", "in",
-            "to", "for", "of", "and", "or", "on", "at", "by", "with", "from",
-            "that", "this", "where", "what", "how", "which", "show", "find",
-            "search", "look", "give", "list", "get", "see", "main", "function",
-        }
-        query_words = [
-            w for w in query.lower().split()
-            if w not in stop_words and len(w) > 1
-        ]
-        tag_results: List[Dict[str, Any]] = []
-        for word in query_words:
-            tag_results.extend(self.cache.search_by_tags(word, limit=20))
-        
-        # ── Cypher fallback cascade ──────────────────────────────
-        parts = original_pattern.split(':')
-        cypher_results: List[Dict[str, Any]] = []
-        
-        if len(parts) == 2:
-            dom = parts[0]
-            rest = parts[1].split('--')
-            if len(rest) == 2:
-                act_obj = rest[0].split('_')
-                pat = rest[1]
-                if len(act_obj) == 2:
-                    act, obj = act_obj
-                    
-                    fallback_patterns = [
-                        f"{dom}:{act}_*--{pat}",      # Wildcard object
-                        f"{dom}:*_{obj}--{pat}",      # Wildcard action
-                        f"{dom}:{act}_*--*",          # Wildcard object and pattern
-                        f"{dom}:*_*--{pat}",          # Keep only domain and pattern
-                        f"{dom}:*_*--*",              # Keep only domain
-                        f"*:{act}_*--*",              # Keep only action
-                    ]
-                    
-                    for pattern in fallback_patterns:
-                        if pattern == original_pattern:
-                            continue
-                        logger.debug(f"Trying fallback: {pattern}")
-                        results = self.cache.search_by_cypher(
-                            pattern, limit=Config.MAX_SEARCH_RESULTS
-                        )
-                        if results:
-                            logger.info(f"Found {len(results)} results with pattern: {pattern}")
-                            cypher_results = results
-                            break
-        
-        # ── Merge & deduplicate ──────────────────────────────────
-        seen_keys = set()
-        merged: List[Dict[str, Any]] = []
-        for r in cypher_results + tag_results:
-            key = (r['file_path'], r['function_name'], r['line_start'])
-            if key not in seen_keys:
-                seen_keys.add(key)
-                merged.append(r)
-        
-        if merged:
-            logger.info(
-                f"Fallback total: {len(merged)} unique results "
-                f"({len(cypher_results)} from Cypher, {len(tag_results)} from tags)"
+            obj_word = (
+                obj_matches[0]
+                if isinstance(obj_matches[0], str)
+                else obj_matches[0][0]
             )
-        
+            obj = obj_word[:4].upper().ljust(4, '*')
+
+        return f"{dom}:{act}_{obj}--{pat}"
+
+    @classmethod
+    def _extract_keywords(cls, query: str) -> List[str]:
+        """
+        Extract meaningful keywords from a natural-language query.
+
+        Filters stop words and very short tokens so that only
+        semantically significant words remain for tag / name matching.
+        """
+        return [
+            w for w in query.lower().split()
+            if w not in Config.STOP_WORDS and len(w) > 2
+        ]
+
+    # ── Multi-lane retrieval ──────────────────────────────────────
+
+    def _multi_lane_search(self, query: str, cypher_pattern: str,
+                           max_results: int) -> List[Dict[str, Any]]:
+        """
+        Always-on multi-lane search.
+
+        Runs several parallel retrieval strategies and merges unique
+        results for unified ranking.
+
+        Lanes:
+          1. Exact Cypher pattern     — highest precision
+          2. Domain-wildcarded Cypher  — cross-domain recall
+          3. Action-only Cypher        — broadest Cypher recall
+          4. Tag keyword search        — semantic tags
+          5. Function name search      — literal name matching
+        """
+        fetch_limit = max(max_results * 5, 30)
+
+        seen: set = set()
+        merged: List[Dict[str, Any]] = []
+
+        def _add(results: List[Dict[str, Any]]) -> None:
+            """Append de-duplicated results to *merged*."""
+            for r in results:
+                key = (r["file_path"], r["function_name"],
+                       r.get("line_start", 0))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(r)
+
+        # ── Lane 1: Exact Cypher pattern ─────────────────────────
+        _add(self.cache.search_by_cypher(cypher_pattern, limit=fetch_limit))
+
+        # ── Lane 2: Domain-wildcarded (same ACT_OBJ--PAT) ───────
+        parts = cypher_pattern.split(":")
+        if len(parts) == 2:
+            dom, rest_str = parts
+            if dom != "*":
+                _add(self.cache.search_by_cypher(
+                    f"*:{rest_str}", limit=fetch_limit
+                ))
+        else:
+            rest_str = cypher_pattern
+
+        # ── Lane 3: Action-only (broadest Cypher) ────────────────
+        rest = rest_str.split("--")
+        if len(rest) == 2:
+            act_obj = rest[0].split("_")
+            if len(act_obj) == 2:
+                act = act_obj[0]
+                if act != "*":
+                    _add(self.cache.search_by_cypher(
+                        f"*:{act}_*--*", limit=fetch_limit
+                    ))
+
+        # ── Lane 4: Tag keyword search ───────────────────────────
+        keywords = self._extract_keywords(query)
+        for kw in keywords[:5]:
+            _add(self.cache.search_by_tags(kw, limit=fetch_limit))
+
+        # ── Lane 5: Function name search ─────────────────────────
+        if keywords:
+            _add(self.cache.search_by_name(keywords, limit=fetch_limit))
+
+        logger.debug(
+            f"Multi-lane: {len(merged)} unique candidates "
+            f"(keywords: {keywords[:5]})"
+        )
         return merged
     
     def _process_results(self, raw_results: List[Dict[str, Any]], 
                         cypher_pattern: Optional[str], query: str) -> List[SearchResult]:
         """Convert raw database results to SearchResult objects with scoring."""
         search_results = []
+        
+        # PERFORMANCE FIX: Cache file contents to avoid reading the same file multiple times
+        # (common when multiple functions from the same file match)
+        file_cache: Dict[str, List[str]] = {}
         
         for result in raw_results:
             # Extract tags
@@ -232,11 +258,12 @@ class CypherSearchEngine:
             else:
                 score = 1.0  # Base score for tag searches
             
-            # Extract context
-            context = self._extract_context(
-                Path(result['file_path']),
+            # Extract context (with file caching)
+            context = self._extract_context_cached(
+                result['file_path'],
                 result['line_start'],
-                result['line_end']
+                result['line_end'],
+                file_cache
             )
             
             search_results.append(SearchResult(
@@ -251,14 +278,24 @@ class CypherSearchEngine:
         
         return search_results
     
-    def _extract_context(self, file_path: Path, start_line: int, 
-                        end_line: int, context_lines: int = 3) -> str:
-        """Extract code context around a function."""
+    def _extract_context_cached(self, file_path: str, start_line: int, 
+                                end_line: int, file_cache: Dict[str, List[str]], 
+                                context_lines: int = 3) -> str:
+        """
+        Extract code context around a function (with file caching).
+        
+        PERFORMANCE: Caches file contents per search query to avoid reading
+        the same file multiple times when multiple results come from it.
+        """
         try:
-            if not file_path.exists():
-                return "[File not found]"
+            # Check cache first
+            if file_path not in file_cache:
+                path = Path(file_path)
+                if not path.exists():
+                    return "[File not found]"
+                file_cache[file_path] = path.read_text(encoding='utf-8').splitlines()
             
-            lines = file_path.read_text(encoding='utf-8').splitlines()
+            lines = file_cache[file_path]
             
             # Get function definition (first few lines)
             func_lines = lines[start_line - 1:min(start_line + context_lines, end_line)]
@@ -283,18 +320,8 @@ class ResultFormatter:
 
     @staticmethod
     def _detect_language(file_path: str) -> str:
-        """Infer a short language label from the file extension."""
-        ext = os.path.splitext(file_path)[1].lower()
-        lang_map = {
-            ".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
-            ".mjs": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
-            ".java": "Java", ".go": "Go", ".rs": "Rust",
-            ".c": "C", ".h": "C", ".cpp": "C++", ".hpp": "C++",
-            ".cc": "C++", ".cxx": "C++", ".cs": "C#",
-            ".rb": "Ruby", ".php": "PHP", ".swift": "Swift",
-            ".kt": "Kotlin", ".kts": "Kotlin",
-        }
-        return lang_map.get(ext, "")
+        """Return language label (Python-only for v1)."""
+        return "Python" if file_path.endswith(".py") else ""
 
     @staticmethod
     def _numbered_preview(context: str, start_line: int) -> List[str]:
@@ -308,10 +335,22 @@ class ResultFormatter:
     # ── Console (human-friendly) ──────────────────────────────────
 
     @staticmethod
-    def format_console(results: List[SearchResult], show_context: bool = True) -> str:
+    def format_console(results: List[SearchResult], show_context: bool = True,
+                       start_index: int = 1, total_count: int | None = None,
+                       elapsed_time: float | None = None) -> str:
         """
         Rich console output with full paths, line numbers, language
         labels, and a numbered code preview.
+
+        Args:
+            results: The (page of) results to render.
+            show_context: Include a numbered code preview.
+            start_index: Global 1-based index for the first result
+                         (used for paginated output so numbering is
+                         continuous across pages).
+            total_count: Total result count across all pages.  When
+                         *None* the header shows ``len(results)``.
+            elapsed_time: Optional search time in seconds to display in header.
         """
         if not results:
             return "\n  No results found.\n"
@@ -320,12 +359,22 @@ class ResultFormatter:
         width = min(shutil.get_terminal_size().columns, 78)
         thin = "─" * width
 
+        display_total = total_count if total_count is not None else len(results)
+
+        # Build header with optional timing
+        header = f"  SYMDEX — {display_total} result{'s' if display_total != 1 else ''}"
+        if elapsed_time is not None:
+            # Format timing with explicit control (avoid locale comma/period confusion)
+            timing_str = f"{elapsed_time:.4f}".replace(',', '.')
+            header += f" in {timing_str} seconds"
+
         out: List[str] = []
         out.append(f"\n{thin}")
-        out.append(f"  SYMDEX — {len(results)} result{'s' if len(results) != 1 else ''}")
+        out.append(header)
         out.append(thin)
 
-        for idx, r in enumerate(results, 1):
+        for offset, r in enumerate(results):
+            idx = start_index + offset
             lang = ResultFormatter._detect_language(r.file_path)
             lang_label = f"  ({lang})" if lang else ""
 

@@ -71,11 +71,10 @@ def cli(ctx: click.Context, provider: str | None):
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def index(directory: str, cache_dir: str | None, force: bool,
           dry_run: bool, verbose: bool):
-    """Index source files in DIRECTORY and build a sidecar search index.
+    """Index Python source files in DIRECTORY and build a sidecar search index.
 
     Metadata is stored in a .symdex/ directory — source files are never
-    modified.  Supports Python, JavaScript/TypeScript, Java, Go, Rust,
-    C/C++, C#, Ruby, PHP, Swift, and Kotlin.
+    modified. Python-only for v1 (multi-language support planned).
     """
     _configure_logging(verbose)
     _validate_api_key()
@@ -112,13 +111,16 @@ def index(directory: str, cache_dir: str | None, force: bool,
               default="console", help="Output format.")
 @click.option("-n", "--max-results", type=int, default=None,
               help="Maximum number of results.")
+@click.option("-p", "--page-size", type=int, default=None,
+              help="Results per page (enables interactive pagination).")
 @click.option("--strategy",
               type=click.Choice(["auto", "llm", "keyword", "direct"]),
               default="auto", help="Query translation strategy.")
 @click.option("--min-score", type=float, default=None,
               help="Minimum relevance score to display.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
-def search(query: str, cache_dir: str | None, fmt: str, max_results: int | None,
+def search(query: str, cache_dir: str | None, fmt: str,
+           max_results: int | None, page_size: int | None,
            strategy: str, min_score: float | None, verbose: bool):
     """Search the Symdex index with a natural-language QUERY or Cypher pattern."""
     _configure_logging(verbose)
@@ -133,7 +135,8 @@ def search(query: str, cache_dir: str | None, fmt: str, max_results: int | None,
         if cache_dir:
             click.echo(
                 "Hint: In Docker, --cache-dir must be the path *inside* the container. "
-                "Mount the indexed project, e.g.: docker compose run -v E:/CodeDD:/data symdex symdex search \"...\" --cache-dir /data/.symdex",
+                "Mount the indexed project, e.g.: docker compose run -v E:/CodeDD:/data "
+                "symdex symdex search \"...\" --cache-dir /data/.symdex",
                 err=True,
             )
         raise SystemExit(1)
@@ -149,18 +152,115 @@ def search(query: str, cache_dir: str | None, fmt: str, max_results: int | None,
     score_threshold = min_score if min_score is not None else Config.MIN_SEARCH_SCORE
     results = [r for r in results if r.score >= score_threshold]
 
+    # Calculate elapsed time for display
+    elapsed = time.perf_counter() - t0
+    
     formatter = ResultFormatter()
+
+    # ── Non-console formats: dump everything at once ─────────
     if fmt == "json":
         click.echo(formatter.format_json(results))
+        # Show timing for non-console formats at the bottom
+        timing_str = f"{elapsed:.3f}".replace(',', '.')
+        click.echo(f"  Completed in {timing_str} seconds")
     elif fmt == "compact":
         click.echo(formatter.format_compact(results))
+        timing_str = f"{elapsed:.3f}".replace(',', '.')
+        click.echo(f"  Completed in {timing_str} seconds")
     elif fmt == "ide":
         click.echo(formatter.format_ide(results))
+        timing_str = f"{elapsed:.3f}".replace(',', '.')
+        click.echo(f"  Completed in {timing_str} seconds")
     else:
-        click.echo(formatter.format_console(results))
+        # ── Console format with optional pagination (timing in header) ──────────
+        _display_console_results(results, formatter, page_size, elapsed)
 
-    elapsed = time.perf_counter() - t0
-    click.echo(f"  Completed in {elapsed:.3f}s")
+
+# ---------------------------------------------------------------------------
+# Pagination helper
+# ---------------------------------------------------------------------------
+
+def _display_console_results(
+    results: list,
+    formatter: ResultFormatter,
+    page_size: int | None,
+    elapsed_time: float,
+) -> None:
+    """
+    Print search results to the console, optionally paginated.
+
+    When *page_size* is ``None`` (the default) all results are printed
+    at once — identical to the previous behaviour.  When set, results
+    are split into pages and the user can navigate interactively.
+
+    Pagination commands (case-insensitive):
+      Enter / n  — next page
+      b / back   — previous page
+      p / print  — reprint current page
+      j / json   — dump current page as JSON
+      q / quit   — stop
+    """
+    if not results or not page_size or page_size <= 0:
+        # No pagination — single dump (with timing in header)
+        click.echo(formatter.format_console(results, elapsed_time=elapsed_time))
+        return
+
+    import math
+    total = len(results)
+    total_pages = math.ceil(total / page_size)
+    page_num = 0
+
+    while page_num < total_pages:
+        start = page_num * page_size
+        end = min(start + page_size, total)
+        page = results[start:end]
+
+        # Render the current page (with timing in header)
+        click.echo(formatter.format_console(
+            page,
+            start_index=start + 1,
+            total_count=total,
+            elapsed_time=elapsed_time,
+        ))
+
+        # Last page — nothing more to navigate
+        if total_pages == 1 or page_num == total_pages - 1:
+            if total_pages > 1:
+                click.echo(f"  Page {page_num + 1}/{total_pages} (end)")
+            break
+
+        # Interactive prompt
+        try:
+            hint = (
+                f"  Page {page_num + 1}/{total_pages}  "
+                f"[Enter] next  [b] back  [p] print  [j] json  [q] quit"
+            )
+            answer = click.prompt(hint, default="", show_default=False)
+            cmd = answer.strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            click.echo("\n  Stopped.")
+            return
+
+        if cmd in ("q", "quit", "exit"):
+            click.echo("  Stopped.")
+            return
+        elif cmd in ("b", "back"):
+            if page_num > 0:
+                page_num -= 1
+            else:
+                click.echo("  Already on the first page.")
+            # Re-render by continuing the loop (no page_num increment)
+            continue
+        elif cmd in ("p", "print"):
+            # Reprint current page (loop continues without increment)
+            continue
+        elif cmd in ("j", "json"):
+            click.echo(formatter.format_json(page))
+            # Stay on the same page so the user can still navigate
+            continue
+        else:
+            # Enter / n / anything else → next page
+            page_num += 1
 
 
 # ---------------------------------------------------------------------------

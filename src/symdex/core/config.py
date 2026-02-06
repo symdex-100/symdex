@@ -47,27 +47,12 @@ class Config:
     RETRY_ATTEMPTS: int = 3
     RETRY_BACKOFF_BASE: float = 2.0
     
-    # File Processing — all supported languages
+    # File Processing — Python only (v1)
     # frozenset for O(1) membership tests during directory scanning
-    TARGET_EXTENSIONS: frozenset = frozenset((
-        ".py",                          # Python
-        ".js", ".jsx", ".mjs",          # JavaScript
-        ".ts", ".tsx",                  # TypeScript
-        ".java",                        # Java
-        ".go",                          # Go
-        ".rs",                          # Rust
-        ".c", ".h",                     # C
-        ".cpp", ".hpp", ".cc", ".cxx",  # C++
-        ".cs",                          # C#
-        ".rb",                          # Ruby
-        ".php",                         # PHP
-        ".swift",                       # Swift
-        ".kt", ".kts",                  # Kotlin
-    ))
+    TARGET_EXTENSIONS: frozenset = frozenset((".py",))
     EXCLUDE_DIRS: frozenset = frozenset((
         "__pycache__", ".git", ".venv", "venv",
-        "node_modules", ".pytest_cache", "dist", "build",
-        "target", "bin", "obj", ".gradle", ".idea",
+        ".pytest_cache", "dist", "build",
         ".symdex",  # Symdex sidecar index directory
     ))
     MAX_FILE_SIZE_MB: int = 5
@@ -87,7 +72,18 @@ class Config:
     
     # Search Configuration
     MAX_SEARCH_RESULTS: int = 5
-    MIN_SEARCH_SCORE: float = float(os.getenv("CYPHER_MIN_SCORE", "7.0"))
+    MIN_SEARCH_SCORE: float = float(os.getenv("CYPHER_MIN_SCORE", "5.0"))
+    
+    # Stop words for query/tag/name matching (centralized to avoid duplication)
+    STOP_WORDS: frozenset = frozenset({
+        "i", "a", "the", "is", "it", "do", "we", "my", "me", "an", "in",
+        "to", "for", "of", "and", "or", "on", "at", "by", "with", "from",
+        "that", "this", "where", "what", "how", "which", "show", "find",
+        "search", "look", "give", "list", "get", "see", "main", "function",
+        "code", "define", "does", "are", "was", "were", "been", "being",
+        "have", "has", "had", "having", "can", "could", "should", "would",
+    })
+    
     SEARCH_RANKING_WEIGHTS: dict = {
         "exact_match": 10.0,
         "domain_match": 5.0,
@@ -96,7 +92,7 @@ class Config:
         "object_similarity": 2.0,
         "pattern_match": 2.0,
         "tag_match": 1.5,
-        "name_match": 2.0,      # Boost when query words appear in function name
+        "name_match": 3.0,      # Boosted — function name is a strong relevance signal
     }
     
     # Logging
@@ -300,317 +296,13 @@ COMMON OBJECT CODES (preferred OBJ tokens):
 
 
 # =============================================================================
-# Language Registry — maps file extensions to language metadata
-# =============================================================================
-
-class LanguageRegistry:
-    """
-    Central registry of supported programming languages.
-    
-    Provides comment styles, function-detection regex patterns, and
-    brace-counting hints for each language so the rest of the system
-    stays language-agnostic.
-    """
-
-    # Each language entry contains:
-    #   name            – human-readable language name
-    #   comment_single  – single-line comment prefix (used for SEARCH_META blocks)
-    #   comment_block   – (open, close) for block comments, or None
-    #   extensions      – set of file extensions that map to this language
-    #   function_patterns – list of compiled regex patterns that match function
-    #                       definitions.  Each pattern MUST define named groups:
-    #                         - 'name'   (the function/method name)
-    #                         - 'args'   (the argument list, raw text)
-    #                       And may optionally define:
-    #                         - 'async'  (if present, the function is async)
-    #   uses_braces     – whether the language uses { } to delimit bodies
-    #   uses_indent     – whether the language uses indentation (Python)
-
-    _LANGUAGES: dict = {}  # populated by register() calls below
-
-    @classmethod
-    def register(cls, key: str, *, name: str, comment_single: str,
-                 comment_block: tuple = None, extensions: tuple = (),
-                 function_patterns: list = None, uses_braces: bool = True,
-                 uses_indent: bool = False):
-        """Register a language definition."""
-        import re as _re
-        compiled_patterns = []
-        for pat_str in (function_patterns or []):
-            compiled_patterns.append(_re.compile(pat_str, _re.MULTILINE))
-
-        cls._LANGUAGES[key] = {
-            "name": name,
-            "comment_single": comment_single,
-            "comment_block": comment_block,
-            "extensions": set(extensions),
-            "function_patterns": compiled_patterns,
-            "uses_braces": uses_braces,
-            "uses_indent": uses_indent,
-        }
-
-    @classmethod
-    def detect_language(cls, file_path) -> dict | None:
-        """
-        Detect the language for a given file path based on its extension.
-        
-        Returns the language dict or None if unsupported.
-        """
-        ext = str(file_path).rsplit(".", 1)[-1] if "." in str(file_path) else ""
-        ext = f".{ext}"
-        for lang in cls._LANGUAGES.values():
-            if ext in lang["extensions"]:
-                return lang
-        return None
-
-    @classmethod
-    def get_language(cls, key: str) -> dict | None:
-        """Retrieve a language definition by key."""
-        return cls._LANGUAGES.get(key)
-
-    @classmethod
-    def supported_extensions(cls) -> set:
-        """Return the union of all registered extensions."""
-        exts: set = set()
-        for lang in cls._LANGUAGES.values():
-            exts |= lang["extensions"]
-        return exts
-
-
-# ── Register all supported languages ─────────────────────────────────────────
-
-# Python
-LanguageRegistry.register(
-    "python",
-    name="Python",
-    comment_single="#",
-    comment_block=('"""', '"""'),
-    extensions=(".py",),
-    uses_braces=False,
-    uses_indent=True,
-    function_patterns=[
-        # async def / def  — captures name, args, optional async keyword
-        r'(?P<async>async\s+)?def\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# JavaScript / TypeScript — keyword guard for class-method patterns.
-# Prevents control-flow statements like `if(cond) {`, `for(…) {`,
-# `while(cond) {` from being misidentified as method definitions.
-_JS_KEYWORD_GUARD = (
-    r'(?!if\b|else\b|for\b|while\b|do\b|switch\b|catch\b|return\b|throw\b'
-    r'|new\b|delete\b|typeof\b|instanceof\b|void\b|await\b|case\b)'
-)
-
-# JavaScript
-LanguageRegistry.register(
-    "javascript",
-    name="JavaScript",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".js", ".jsx", ".mjs"),
-    function_patterns=[
-        # function declarations: [async] [export] function name(args)
-        r'(?:export\s+)?(?P<async>async\s+)?function\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-        # arrow / const fn: [export] const name = [async] (args) =>
-        r'(?:export\s+)?(?:const|let|var)\s+(?P<name>\w+)\s*=\s*(?P<async>async\s+)?\((?P<args>[^)]*)\)\s*=>',
-        # class method: [async] name(args) {  — with keyword guard
-        r'^\s+(?P<async>async\s+)?' + _JS_KEYWORD_GUARD +
-        r'(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*\{',
-    ],
-)
-
-# TypeScript
-LanguageRegistry.register(
-    "typescript",
-    name="TypeScript",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".ts", ".tsx"),
-    function_patterns=[
-        # function declarations with optional type params
-        r'(?:export\s+)?(?P<async>async\s+)?function\s+(?P<name>\w+)\s*(?:<[^>]*>)?\s*\((?P<args>[^)]*)\)',
-        # arrow / const fn with optional type
-        r'(?:export\s+)?(?:const|let|var)\s+(?P<name>\w+)\s*(?::\s*[^=]+)?\s*=\s*(?P<async>async\s+)?\((?P<args>[^)]*)\)\s*(?::\s*\w+)?\s*=>',
-        # class method — with keyword guard
-        # Return type slot accepts simple types (void) and generics (Promise<void>)
-        r'^\s+(?:public|private|protected)?\s*(?:static\s+)?' +
-        r'(?P<async>async\s+)?' + _JS_KEYWORD_GUARD +
-        r'(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*(?::\s*\w+(?:<[^>]*>)?)?\s*\{',
-    ],
-)
-
-# Java
-LanguageRegistry.register(
-    "java",
-    name="Java",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".java",),
-    function_patterns=[
-        # [modifiers] ReturnType name(args) { — excludes constructors-like matches via return type
-        r'(?:public|private|protected)\s+(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?(?:\w+(?:<[^>]*>)?)\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# Go
-LanguageRegistry.register(
-    "go",
-    name="Go",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".go",),
-    function_patterns=[
-        # func (receiver) name(args) [returns] {
-        r'func\s+(?:\([^)]*\)\s+)?(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# Rust
-LanguageRegistry.register(
-    "rust",
-    name="Rust",
-    comment_single="//",
-    comment_block=None,
-    extensions=(".rs",),
-    function_patterns=[
-        # [pub] [async] fn name(args) [-> Type] {
-        r'(?:pub\s+)?(?P<async>async\s+)?fn\s+(?P<name>\w+)\s*(?:<[^>]*>)?\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# C
-# Keyword guard prevents matching `if(cond) {`, `for(...)`, etc. as functions.
-_C_KEYWORD_GUARD = (
-    r'(?!if\b|else\b|for\b|while\b|do\b|switch\b|return\b|sizeof\b'
-    r'|typeof\b|goto\b|case\b)'
-)
-LanguageRegistry.register(
-    "c",
-    name="C",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".c", ".h"),
-    function_patterns=[
-        # ReturnType [*] name(args) {  — top-level definitions
-        r'^(?:static\s+)?(?:inline\s+)?(?:const\s+)?(?:unsigned\s+)?(?:struct\s+)?'
-        r'\w+[\s*]+'
-        + _C_KEYWORD_GUARD +
-        r'(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*\{',
-    ],
-)
-
-# C++
-# Negative lookahead excludes C++ keywords that look like function calls
-# (e.g. `else if(cond) {` where `else` is parsed as return type and `if`
-# as function name).  Pattern 2 no longer matches `;` so variable
-# declarations like `std::lock_guard lock(m)` are excluded.
-_CPP_KEYWORD_GUARD = (
-    r'(?!if\b|else\b|for\b|while\b|do\b|switch\b|catch\b|return\b|throw\b'
-    r'|sizeof\b|alignof\b|decltype\b|typeid\b|static_cast\b|dynamic_cast\b'
-    r'|const_cast\b|reinterpret_cast\b|new\b|delete\b|case\b|goto\b)'
-)
-LanguageRegistry.register(
-    "cpp",
-    name="C++",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".cpp", ".hpp", ".cc", ".cxx"),
-    function_patterns=[
-        # Pattern 1: Standard function/method definition (brace on same line)
-        # ReturnType [Class::]name(args) [const] [override] [noexcept] {
-        r'(?:virtual\s+)?(?:static\s+)?(?:inline\s+)?(?:const\s+)?'
-        r'[\w:]+(?:<[^>]*>)?[\s*&]+(?:[\w:]+::)?'
-        + _CPP_KEYWORD_GUARD +
-        r'(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*'
-        r'(?:const\s*)?(?:override\s*)?(?:noexcept(?:\s*\([^)]*\))?\s*)?\{',
-        # Pattern 2: Function with brace on next line + attribute / trailing return
-        # Does NOT match `;` (declarations / variable inits are excluded)
-        r'(?:virtual\s+)?(?:static\s+)?(?:inline\s+)?(?:const\s+)?'
-        r'(?:\[\[[^\]]+\]\]\s+)?[\w:]+(?:<[^>]*>)?[\s*&]+'
-        r'(?:[\w:]+::)?'
-        + _CPP_KEYWORD_GUARD +
-        r'(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*'
-        r'(?:const\s*)?(?:\s*->\s*[\w:]+(?:<[^>]*>)?)?\s*\{',
-    ],
-)
-
-# C#
-LanguageRegistry.register(
-    "csharp",
-    name="C#",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".cs",),
-    function_patterns=[
-        # [modifiers] ReturnType name(args) {
-        r'(?:public|private|protected|internal)\s+(?:static\s+)?(?:virtual\s+)?(?:override\s+)?(?:async\s+)?(?:\w+(?:<[^>]*>)?)\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# Ruby
-LanguageRegistry.register(
-    "ruby",
-    name="Ruby",
-    comment_single="#",
-    comment_block=("=begin", "=end"),
-    extensions=(".rb",),
-    uses_braces=False,
-    uses_indent=False,  # uses end keyword
-    function_patterns=[
-        # def [self.]name(args)
-        r'def\s+(?:self\.)?(?P<name>\w+[?!=]?)\s*(?:\((?P<args>[^)]*)\))?',
-    ],
-)
-
-# PHP
-LanguageRegistry.register(
-    "php",
-    name="PHP",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".php",),
-    function_patterns=[
-        # [modifiers] function name(args)
-        r'(?:public|private|protected)?\s*(?:static\s+)?function\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# Swift
-LanguageRegistry.register(
-    "swift",
-    name="Swift",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".swift",),
-    function_patterns=[
-        # [modifiers] func name(args) [-> Type] {
-        r'(?:public|private|internal|fileprivate|open)?\s*(?:static\s+)?(?:class\s+)?func\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-# Kotlin
-LanguageRegistry.register(
-    "kotlin",
-    name="Kotlin",
-    comment_single="//",
-    comment_block=("/*", "*/"),
-    extensions=(".kt", ".kts"),
-    function_patterns=[
-        # [modifiers] fun name(args) [: Type] {
-        r'(?:public|private|protected|internal)?\s*(?:suspend\s+)?fun\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)',
-    ],
-)
-
-
-# =============================================================================
 # System Prompts for LLM
 # =============================================================================
 
 class Prompts:
     """Standardized prompts for consistent LLM behavior."""
     
-    CYPHER_GENERATION_SYSTEM = f"""You are a Cypher-100 code classifier. Your task is to analyze functions/methods in ANY programming language and generate a standardized metadata string called a "Cypher".
+    CYPHER_GENERATION_SYSTEM = f"""You are a Cypher-100 code classifier. Your task is to analyze Python functions and generate a standardized metadata string called a "Cypher".
 
 The Cypher format is: DOM:ACT_OBJ--PAT
 
@@ -628,23 +320,20 @@ RULES:
 3. If uncertain, choose the most specific applicable code
 4. Output ONLY the Cypher string, nothing else — no explanations, no caveats
 5. Be consistent: same code logic should always produce the same Cypher
-6. The language does NOT affect classification — the same logic produces the same Cypher regardless of language
-7. **CRITICAL — Non-classifiable code:** If the code is NOT a complete function or method — for example it is a code fragment, a conditional branch (if/else), a loop body, a variable declaration, a single statement, or any incomplete/unidentifiable snippet — respond with exactly the word: SKIP
+6. **CRITICAL — Non-classifiable code:** If the code is NOT a complete function or method — for example it is a code fragment, a conditional branch (if/else), a loop body, a variable declaration, a single statement, or any incomplete/unidentifiable snippet — respond with exactly the word: SKIP
    Do NOT explain why. Do NOT describe what is wrong. Just output: SKIP
 
-EXAMPLES (multiple languages):
+EXAMPLES:
 - Python: "async def send_email(to, subject): ..." → NET:SND_EMAL--ASY
 - Python: "def validate_password(pwd): ..." → SEC:VAL_PASS--SYN
-- JavaScript: "async function fetchUserData(id) {{...}}" → DAT:FET_USER--ASY
-- Go: "func ScrubLogs(stream io.Reader) error {{...}}" → LOG:SCR_LOGS--SYN
-- Rust: "pub async fn render_node(node: &Node) -> Html {{...}}" → UI:TRN_NODE--ASY
-- Java: "public static List<Row> toCsv(Data data) {{...}}" → DAT:TRN_CSV--SYN
-- TypeScript: "export const validateToken = (token: string): boolean => {{...}}" → SEC:VAL_TOKEN--SYN
+- Python: "def fetch_user_data(user_id): ..." → DAT:FET_USER--SYN
+- Python: "async def scrub_sensitive_logs(stream): ..." → LOG:SCR_LOGS--ASY
+- Python: "def transform_csv_to_json(csv_data): ..." → DAT:TRN_JSON--SYN
 """
     
-    CYPHER_GENERATION_USER = """Analyze this {language} function and generate its Cypher:
+    CYPHER_GENERATION_USER = """Analyze this Python function and generate its Cypher:
 
-```{language_lower}
+```python
 {code}
 ```
 
