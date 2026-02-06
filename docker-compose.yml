@@ -1,0 +1,11 @@
+services:
+  symdex:
+    build: .
+    working_dir: /app
+    env_file:
+      - .env
+    volumes:
+      # CODE_DIR should point to the project you want to index.
+      - "${CODE_DIR:-.}:/data"
+
+    command: ["symdex", "--help"]
