@@ -18,9 +18,10 @@ sys.path.insert(0, str(SRC_ROOT))
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Set dummy API keys so Config.validate() does not blow up during
-# import of symdex.core.engine (the validation runs at import time when
-# __name__ != "__main__").
+# Set dummy API keys so that Config / SymdexConfig have valid keys
+# for tests that call validate(), get_api_key(), or create providers.
+# Import-time validation was removed in v1.1 but keys are still needed
+# for functional tests.
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-real")
 os.environ.setdefault("OPENAI_API_KEY", "test-key-not-real")
 os.environ.setdefault("GEMINI_API_KEY", "test-key-not-real")

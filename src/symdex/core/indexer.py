@@ -18,20 +18,16 @@ Production-ready with:
 - Dry-run mode for testing
 """
 
-import argparse
 import logging
-import os
-import sys
 from pathlib import Path
 from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import time
 
-from symdex.core.config import Config
+from symdex.core.config import Config, SymdexConfig
 from symdex.core.engine import (
     CodeAnalyzer, CypherCache, CypherGenerator,
-    FunctionMetadata, scan_directory
+    FunctionMetadata, IndexResult, scan_directory,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,8 +45,15 @@ class IndexingPipeline:
     the ``.symdex/`` directory.  Source files are **never** modified.
     """
 
-    def __init__(self, root_dir: Path, cache_dir: Path | None = None,
-                 dry_run: bool = False, force_reindex: bool = False):
+    def __init__(
+        self,
+        root_dir: Path,
+        cache_dir: Path | None = None,
+        dry_run: bool = False,
+        force_reindex: bool = False,
+        config: SymdexConfig | None = None,
+        show_progress: bool = True,
+    ):
         """
         Initialize the indexing pipeline.
 
@@ -60,21 +63,26 @@ class IndexingPipeline:
                        Defaults to ``root_dir / .symdex``.
             dry_run: If True, run analysis but don't persist to the index.
             force_reindex: If True, re-index even unchanged files.
+            config: Instance-based configuration.  Falls back to
+                ``SymdexConfig.from_env()`` when *None*.
+            show_progress: Show tqdm progress bar (disable for API use).
         """
+        self._config = config or SymdexConfig.from_env()
         self.root_dir = root_dir
         self.dry_run = dry_run
         self.force_reindex = force_reindex
+        self.show_progress = show_progress
 
         # Resolve the sidecar directory
-        self.cache_dir = cache_dir if cache_dir else (root_dir / Config.SYMDEX_DIR)
+        self.cache_dir = cache_dir if cache_dir else (root_dir / self._config.symdex_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize components
-        self.cache = CypherCache(Config.get_cache_path(self.cache_dir))
-        self.generator = CypherGenerator()
+        self.cache = CypherCache(self._config.get_cache_path(self.cache_dir))
+        self.generator = CypherGenerator(config=self._config)
         self.analyzer = CodeAnalyzer()
 
-        # Statistics
+        # Statistics (kept as dict for backward compatibility)
         self.stats = {
             "files_scanned": 0,
             "files_processed": 0,
@@ -85,14 +93,17 @@ class IndexingPipeline:
             "errors": 0,
         }
 
-    def run(self):
+    def run(self) -> IndexResult:
         """
         Execute the full indexing pipeline.
+
+        Returns:
+            :class:`IndexResult` with all indexing statistics.
 
         Steps:
           1. Scan directories for source files
           2. Filter files (skip already-indexed unless --force)
-          3. For each file: extract functions via AST / regex
+          3. For each file: extract functions via AST
           4. For each function: generate Cypher via LLM
           5. Store metadata in the sidecar SQLite index
         """
@@ -112,13 +123,13 @@ class IndexingPipeline:
 
         # ── Step 1: Scan for source files ────────────────────────
         logger.info("[1/4] Scanning for source files...")
-        source_files = scan_directory(self.root_dir)
+        source_files = scan_directory(self.root_dir, config=self._config)
         self.stats["files_scanned"] = len(source_files)
         logger.info(f"  Found {len(source_files):,} source files")
 
         if not source_files:
             logger.warning("No source files found to index. Exiting.")
-            return
+            return self._build_result()
 
         # ── Step 2: Filter files that need indexing ──────────────
         logger.info("[2/4] Checking index for changed files...")
@@ -138,14 +149,15 @@ class IndexingPipeline:
 
         if not files_to_process:
             logger.info("All files are up to date. Nothing to do.")
-            self._print_statistics()
-            return
+            return self._build_result()
 
         # ── Steps 3-4: Process files (parse → LLM → store) ──────
-        logger.info(f"[3-4] Indexing functions ({Config.MAX_CONCURRENT_REQUESTS} workers)...")
+        workers = self._config.max_concurrent_requests
+        logger.info(f"[3-4] Indexing functions ({workers} workers)...")
 
-        with tqdm(total=len(files_to_process), desc="Indexing files", unit="file") as pbar:
-            with ThreadPoolExecutor(max_workers=Config.MAX_CONCURRENT_REQUESTS) as executor:
+        with tqdm(total=len(files_to_process), desc="Indexing files",
+                  unit="file", disable=not self.show_progress) as pbar:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
                     executor.submit(self._process_file, file_path): file_path
                     for file_path in files_to_process
@@ -163,9 +175,23 @@ class IndexingPipeline:
                     finally:
                         pbar.update(1)
 
-        # Print final statistics
         logger.info("=" * 60)
-        self._print_statistics()
+        return self._build_result()
+
+    def _build_result(self) -> IndexResult:
+        """Convert internal stats dict into a typed IndexResult."""
+        cache_stats = self.cache.get_stats()
+        return IndexResult(
+            files_scanned=self.stats["files_scanned"],
+            files_processed=self.stats["files_processed"],
+            files_skipped=self.stats["files_skipped"],
+            functions_found=self.stats["functions_found"],
+            functions_indexed=self.stats["functions_indexed"],
+            functions_skipped=self.stats["functions_skipped"],
+            errors=self.stats["errors"],
+            root_dir=str(self.root_dir),
+            index_dir=str(self.cache_dir),
+        )
 
     def _process_file(self, file_path: Path) -> bool:
         """Process a single Python source file."""
@@ -309,8 +335,13 @@ class IndexingPipeline:
         # Return up to 12 unique tags (more signal = better search)
         return sorted(tags)[:12]
 
-    def _print_statistics(self):
-        """Print final indexing statistics in a human-readable format."""
+    def print_statistics(self):
+        """Print final indexing statistics in a human-readable format.
+
+        Called explicitly by the CLI after ``run()`` completes.
+        Library consumers should inspect the returned :class:`IndexResult`
+        instead.
+        """
         import shutil
         width = min(shutil.get_terminal_size().columns, 78)
         line = "─" * width
@@ -341,106 +372,5 @@ class IndexingPipeline:
         print(line)
 
 
-# =============================================================================
-# Legacy CLI Interface (prefer `symdex index` from cli/main.py)
-# =============================================================================
-
-def main():
-    """Legacy entry point for the indexer."""
-    parser = argparse.ArgumentParser(
-        description="Symdex-100 Batch Indexer — generate a sidecar search index for Python source code",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Index current directory (creates .symdex/ alongside your code)
-  python -m symdex.core.indexer
-
-  # Index specific directory
-  python -m symdex.core.indexer --dir /path/to/project
-
-  # Dry run (analyse but don't write the index)
-  python -m symdex.core.indexer --dry-run
-
-  # Force re-index all files
-  python -m symdex.core.indexer --force
-        """
-    )
-
-    parser.add_argument(
-        'target',
-        nargs='?',
-        type=Path,
-        help='Root directory to index (overrides --dir when provided)'
-    )
-
-    parser.add_argument(
-        '--dir', '-d',
-        type=Path,
-        default=Path.cwd(),
-        help='Root directory to index (default: current directory)'
-    )
-
-    parser.add_argument(
-        '--cache-dir',
-        type=Path,
-        default=None,
-        help='Override the sidecar index directory (default: <root>/.symdex)'
-    )
-
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Analyse code and generate Cyphers without writing the index'
-    )
-
-    parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force re-index all files, even if already indexed'
-    )
-
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Enable verbose logging'
-    )
-
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    try:
-        Config.validate()
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(1)
-
-    root_dir: Path = args.target if args.target is not None else args.dir
-
-    if not root_dir.exists():
-        logger.error(f"Directory does not exist: {root_dir}")
-        sys.exit(1)
-
-    if not root_dir.is_dir():
-        logger.error(f"Path is not a directory: {root_dir}")
-        sys.exit(1)
-
-    try:
-        pipeline = IndexingPipeline(
-            root_dir=root_dir,
-            cache_dir=args.cache_dir,
-            dry_run=args.dry_run,
-            force_reindex=args.force,
-        )
-        pipeline.run()
-    except KeyboardInterrupt:
-        logger.warning("\nIndexing interrupted by user")
-        sys.exit(130)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+# NOTE: Legacy CLI main() removed in v1.1.
+# Use ``symdex index`` (symdex.cli.main) or the Symdex facade instead.

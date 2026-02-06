@@ -11,24 +11,19 @@ import hashlib
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
-from symdex.core.config import Config, CypherSchema, Prompts
+from symdex.core.config import Config, CypherSchema, Prompts, SymdexConfig
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL),
-    format=Config.LOG_FORMAT
-)
+# NOTE: Module-level logging.basicConfig() removed (v1.1).
+# Application code (CLI, MCP server) is responsible for configuring logging.
+# This avoids side effects when symdex is imported as a library.
 logger = logging.getLogger(__name__)
-
-# Suppress noisy HTTP request logs from httpx / httpcore
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # =============================================================================
@@ -111,6 +106,24 @@ class SearchResult:
     
     def __lt__(self, other):
         return self.score > other.score  # Higher score = better
+
+
+@dataclass
+class IndexResult:
+    """Typed result returned by :meth:`IndexingPipeline.run`.
+
+    Provides structured access to indexing statistics without requiring
+    callers to inspect internal pipeline state.
+    """
+    files_scanned: int = 0
+    files_processed: int = 0
+    files_skipped: int = 0
+    functions_found: int = 0
+    functions_indexed: int = 0
+    functions_skipped: int = 0
+    errors: int = 0
+    root_dir: str = ""
+    index_dir: str = ""
 
 
 # =============================================================================
@@ -250,119 +263,125 @@ class CodeAnalyzer:
 # =============================================================================
 
 class CypherCache:
-    """SQLite-based cache for indexed files and Cypher metadata."""
-    
+    """SQLite-based cache for indexed files and Cypher metadata.
+
+    Uses thread-local connections so that each thread reuses a single
+    connection instead of opening/closing one per method call.  This is
+    both more efficient and thread-safe (each thread has its own conn).
+    """
+
     def __init__(self, db_path: Path):
         self.db_path = db_path
+        self._local = threading.local()
         self._init_db()
-    
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Return a thread-local SQLite connection, creating it on first use."""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self.db_path)
+        return self._local.conn
+
     def _init_db(self):
         """Initialize the database schema."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS indexed_files (
-                    file_path TEXT PRIMARY KEY,
-                    file_hash TEXT NOT NULL,
-                    last_indexed TIMESTAMP NOT NULL,
-                    function_count INTEGER DEFAULT 0
-                )
-            """)
-            
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS cypher_index (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_path TEXT NOT NULL,
-                    function_name TEXT NOT NULL,
-                    line_start INTEGER NOT NULL,
-                    line_end INTEGER NOT NULL,
-                    cypher TEXT NOT NULL,
-                    tags TEXT,
-                    signature TEXT,
-                    complexity TEXT,
-                    indexed_at TIMESTAMP NOT NULL,
-                    FOREIGN KEY (file_path) REFERENCES indexed_files (file_path) ON DELETE CASCADE
-                )
-            """)
-            
-            # Create indexes for fast searching
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_cypher ON cypher_index(cypher)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON cypher_index(file_path)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_function_name ON cypher_index(function_name)")
-            
-            conn.commit()
-    
+        conn = self._get_connection()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS indexed_files (
+                file_path TEXT PRIMARY KEY,
+                file_hash TEXT NOT NULL,
+                last_indexed TIMESTAMP NOT NULL,
+                function_count INTEGER DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cypher_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                function_name TEXT NOT NULL,
+                line_start INTEGER NOT NULL,
+                line_end INTEGER NOT NULL,
+                cypher TEXT NOT NULL,
+                tags TEXT,
+                signature TEXT,
+                complexity TEXT,
+                indexed_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (file_path) REFERENCES indexed_files (file_path) ON DELETE CASCADE
+            )
+        """)
+
+        # Create indexes for fast searching
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cypher ON cypher_index(cypher)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON cypher_index(file_path)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_function_name ON cypher_index(function_name)")
+        conn.commit()
+
     def get_file_hash(self, file_path: Path) -> str:
         """Compute SHA256 hash of file contents."""
         return hashlib.sha256(file_path.read_bytes()).hexdigest()
-    
+
     def is_file_indexed(self, file_path: Path) -> bool:
         """Check if file is already indexed and up-to-date."""
         current_hash = self.get_file_hash(file_path)
-        
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "SELECT file_hash FROM indexed_files WHERE file_path = ?",
-                (str(file_path),)
-            )
-            row = cursor.fetchone()
-            
-            if row and row[0] == current_hash:
-                return True
-        return False
-    
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "SELECT file_hash FROM indexed_files WHERE file_path = ?",
+            (str(file_path),),
+        )
+        row = cursor.fetchone()
+        return bool(row and row[0] == current_hash)
+
     def mark_file_indexed(self, file_path: Path, function_count: int):
         """Mark a file as indexed."""
         file_hash = self.get_file_hash(file_path)
-        
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO indexed_files (file_path, file_hash, last_indexed, function_count)
-                VALUES (?, ?, ?, ?)
-            """, (str(file_path), file_hash, datetime.now(), function_count))
-            conn.commit()
-    
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO indexed_files (file_path, file_hash, last_indexed, function_count)
+            VALUES (?, ?, ?, ?)
+        """, (str(file_path), file_hash, datetime.now(), function_count))
+        conn.commit()
+
     def add_cypher_entry(self, file_path: Path, function_name: str, line_start: int,
                          line_end: int, cypher: str, tags: List[str],
                          signature: str, complexity: str):
         """Add a Cypher entry to the index."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT INTO cypher_index 
-                (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (str(file_path), function_name, line_start, line_end, cypher,
-                  ",".join(tags), signature, complexity, datetime.now()))
-            conn.commit()
-    
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT INTO cypher_index
+            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (str(file_path), function_name, line_start, line_end, cypher,
+              ",".join(tags), signature, complexity, datetime.now()))
+        conn.commit()
+
     def search_by_cypher(self, pattern: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Search for functions matching a Cypher pattern (supports wildcards)."""
-        # Convert Cypher pattern to SQL LIKE pattern
         sql_pattern = pattern.replace("*", "%")
-        
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute("""
-                SELECT file_path, function_name, line_start, line_end, cypher, tags, signature
-                FROM cypher_index
-                WHERE cypher LIKE ?
-                ORDER BY indexed_at DESC
-                LIMIT ?
-            """, (sql_pattern, limit))
-            
-            return [dict(row) for row in cursor.fetchall()]
-    
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("""
+            SELECT file_path, function_name, line_start, line_end, cypher, tags, signature
+            FROM cypher_index
+            WHERE cypher LIKE ?
+            ORDER BY indexed_at DESC
+            LIMIT ?
+        """, (sql_pattern, limit))
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None  # Reset for other queries
+        return results
+
     def search_by_tags(self, tag: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Search for functions by tag."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute("""
-                SELECT file_path, function_name, line_start, line_end, cypher, tags
-                FROM cypher_index
-                WHERE tags LIKE ?
-                LIMIT ?
-            """, (f"%{tag}%", limit))
-            
-            return [dict(row) for row in cursor.fetchall()]
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("""
+            SELECT file_path, function_name, line_start, line_end, cypher, tags
+            FROM cypher_index
+            WHERE tags LIKE ?
+            LIMIT ?
+        """, (f"%{tag}%", limit))
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return results
 
     def search_by_name(self, keywords: List[str], limit: int = 50) -> List[Dict[str, Any]]:
         """
@@ -375,42 +394,43 @@ class CypherCache:
         if not keywords:
             return []
 
-        # Build OR-chained LIKE conditions (one per keyword)
         conditions = " OR ".join(["function_name LIKE ?"] * len(keywords))
         params: list = [f"%{kw}%" for kw in keywords]
 
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(f"""
-                SELECT file_path, function_name, line_start, line_end,
-                       cypher, tags, signature
-                FROM cypher_index
-                WHERE {conditions}
-                ORDER BY indexed_at DESC
-                LIMIT ?
-            """, params + [limit])
-            return [dict(row) for row in cursor.fetchall()]
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(f"""
+            SELECT file_path, function_name, line_start, line_end,
+                   cypher, tags, signature
+            FROM cypher_index
+            WHERE {conditions}
+            ORDER BY indexed_at DESC
+            LIMIT ?
+        """, params + [limit])
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return results
 
     def get_stats(self) -> Dict[str, int]:
         """Get indexing statistics."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("SELECT COUNT(*) FROM indexed_files")
-            file_count = cursor.fetchone()[0]
-            
-            cursor = conn.execute("SELECT COUNT(*) FROM cypher_index")
-            function_count = cursor.fetchone()[0]
-            
-            return {
-                "indexed_files": file_count,
-                "indexed_functions": function_count
-            }
-    
+        conn = self._get_connection()
+        cursor = conn.execute("SELECT COUNT(*) FROM indexed_files")
+        file_count = cursor.fetchone()[0]
+
+        cursor = conn.execute("SELECT COUNT(*) FROM cypher_index")
+        function_count = cursor.fetchone()[0]
+
+        return {
+            "indexed_files": file_count,
+            "indexed_functions": function_count,
+        }
+
     def clear_file_entries(self, file_path: Path):
         """Remove all entries for a specific file."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM cypher_index WHERE file_path = ?", (str(file_path),))
-            conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (str(file_path),))
-            conn.commit()
+        conn = self._get_connection()
+        conn.execute("DELETE FROM cypher_index WHERE file_path = ?", (str(file_path),))
+        conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (str(file_path),))
+        conn.commit()
 
 
 # =============================================================================
@@ -430,8 +450,8 @@ class LLMProvider:
         self,
         system: str,
         user_message: str,
-        max_tokens: int = Config.LLM_MAX_TOKENS,
-        temperature: float = Config.LLM_TEMPERATURE,
+        max_tokens: int = 300,
+        temperature: float = 0.0,
     ) -> str:
         """Return the assistant's text response for the given prompts."""
         raise NotImplementedError
@@ -440,7 +460,7 @@ class LLMProvider:
 class AnthropicProvider(LLMProvider):
     """Anthropic (Claude) provider — uses the ``anthropic`` SDK."""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "claude-haiku-4-5"):
         try:
             import anthropic  # Lazy import
         except (ImportError, ModuleNotFoundError) as exc:
@@ -450,11 +470,11 @@ class AnthropicProvider(LLMProvider):
                 "  Or switch provider:  export SYMDEX_LLM_PROVIDER=openai"
             ) from exc
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = Config.ANTHROPIC_MODEL
+        self.model = model
 
     def complete(self, system: str, user_message: str,
-                 max_tokens: int = Config.LLM_MAX_TOKENS,
-                 temperature: float = Config.LLM_TEMPERATURE) -> str:
+                 max_tokens: int = 300,
+                 temperature: float = 0.0) -> str:
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
@@ -468,7 +488,7 @@ class AnthropicProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     """OpenAI (GPT) provider — uses the ``openai`` SDK."""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         try:
             import openai  # Lazy import
         except (ImportError, ModuleNotFoundError) as exc:
@@ -478,11 +498,11 @@ class OpenAIProvider(LLMProvider):
                 "  Or switch provider:  export SYMDEX_LLM_PROVIDER=anthropic"
             ) from exc
         self.client = openai.OpenAI(api_key=api_key)
-        self.model = Config.OPENAI_MODEL
+        self.model = model
 
     def complete(self, system: str, user_message: str,
-                 max_tokens: int = Config.LLM_MAX_TOKENS,
-                 temperature: float = Config.LLM_TEMPERATURE) -> str:
+                 max_tokens: int = 300,
+                 temperature: float = 0.0) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             max_tokens=max_tokens,
@@ -498,7 +518,7 @@ class OpenAIProvider(LLMProvider):
 class GeminiProvider(LLMProvider):
     """Google Gemini provider — uses the ``google-genai`` SDK."""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
         try:
             from google import genai  # Lazy import
         except (ImportError, ModuleNotFoundError) as exc:
@@ -508,11 +528,11 @@ class GeminiProvider(LLMProvider):
                 "  Or switch provider:  export SYMDEX_LLM_PROVIDER=anthropic"
             ) from exc
         self.client = genai.Client(api_key=api_key)
-        self.model = Config.GEMINI_MODEL
+        self.model = model
 
     def complete(self, system: str, user_message: str,
-                 max_tokens: int = Config.LLM_MAX_TOKENS,
-                 temperature: float = Config.LLM_TEMPERATURE) -> str:
+                 max_tokens: int = 300,
+                 temperature: float = 0.0) -> str:
         from google.genai import types
 
         response = self.client.models.generate_content(
@@ -535,21 +555,32 @@ _PROVIDER_REGISTRY: Dict[str, type] = {
 }
 
 
-def _create_provider(provider: str | None = None, api_key: str | None = None) -> LLMProvider:
+def _create_provider(
+    provider: str | None = None,
+    api_key: str | None = None,
+    config: SymdexConfig | None = None,
+) -> LLMProvider:
     """
     Factory that instantiates the correct :class:`LLMProvider`.
 
-    Uses ``Config.LLM_PROVIDER`` and the matching API key unless
-    explicit overrides are given.
+    When *config* is provided, provider name, API key, and model are
+    read from the instance.  Falls back to ``SymdexConfig.from_env()``
+    when no explicit config is given.
     """
-    provider = (provider or Config.LLM_PROVIDER).lower()
+    cfg = config or SymdexConfig.from_env()
+    provider = (provider or cfg.llm_provider).lower()
     if provider not in _PROVIDER_REGISTRY:
         raise ValueError(
             f"Unknown LLM provider '{provider}'. "
             f"Supported: {', '.join(_PROVIDER_REGISTRY)}"
         )
-    api_key = api_key or Config.get_api_key()
-    return _PROVIDER_REGISTRY[provider](api_key=api_key)
+    api_key = api_key or cfg.get_api_key()
+    model_map = {
+        "anthropic": cfg.anthropic_model,
+        "openai": cfg.openai_model,
+        "gemini": cfg.gemini_model,
+    }
+    return _PROVIDER_REGISTRY[provider](api_key=api_key, model=model_map[provider])
 
 
 # =============================================================================
@@ -561,17 +592,49 @@ class CypherGenerator:
     LLM-powered Cypher fingerprint generator.
 
     Works with any configured provider (Anthropic, OpenAI, Gemini).
-    The active provider is determined by ``Config.LLM_PROVIDER`` unless
-    an explicit ``provider`` / ``api_key`` pair is passed.
+    The LLM provider is created **lazily** on first use, so constructing
+    a ``CypherGenerator`` does not require an API key until an LLM call
+    is actually made.
+
+    Args:
+        api_key: Explicit API key override.
+        provider: Explicit provider name override.
+        config: Instance-based configuration.  Falls back to
+            ``SymdexConfig.from_env()`` when *None*.
     """
 
-    def __init__(self, api_key: str | None = None, *, provider: str | None = None):
-        self.llm: LLMProvider = _create_provider(provider=provider, api_key=api_key)
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        provider: str | None = None,
+        config: SymdexConfig | None = None,
+    ):
+        self._config = config or SymdexConfig.from_env()
+        self._api_key = api_key
+        self._provider_name = provider
+        # Lazy — created on first actual LLM call via _ensure_llm()
+        self.llm: LLMProvider | None = None
 
     # Maximum length of a valid Cypher string (e.g. "SEC:VAL_HTTPREQUEST--ASY").
     # Responses longer than this that don't validate are treated as
     # LLM explanations and cause an immediate skip (no retry).
     _MAX_CYPHER_LENGTH = 40
+
+    @property
+    def _effective_config(self) -> SymdexConfig:
+        """Config accessor safe for instances created via ``__new__``."""
+        return getattr(self, "_config", None) or SymdexConfig.from_env()
+
+    def _ensure_llm(self) -> LLMProvider:
+        """Create the LLM provider on first use (lazy initialization)."""
+        if self.llm is None:
+            self.llm = _create_provider(
+                provider=getattr(self, "_provider_name", None),
+                api_key=getattr(self, "_api_key", None),
+                config=self._effective_config,
+            )
+        return self.llm
 
     def generate_cypher(self, function_code: str, metadata: FunctionMetadata) -> Optional[str]:
         """
@@ -582,17 +645,21 @@ class CypherGenerator:
         explanation text instead of a valid Cypher.
 
         Retries on both API errors AND invalid LLM responses (up to
-        ``RETRY_ATTEMPTS`` total).  Only falls back to the rule-based
+        ``retry_attempts`` total).  Only falls back to the rule-based
         generator after all attempts are exhausted.
         """
         import time
-        for attempt in range(1, Config.RETRY_ATTEMPTS + 1):
+
+        cfg = self._effective_config
+        for attempt in range(1, cfg.retry_attempts + 1):
             try:
-                cypher = self.llm.complete(
+                cypher = self._ensure_llm().complete(
                     system=Prompts.CYPHER_GENERATION_SYSTEM,
                     user_message=Prompts.CYPHER_GENERATION_USER.format(
                         code=function_code,
                     ),
+                    max_tokens=cfg.llm_max_tokens,
+                    temperature=cfg.llm_temperature,
                 )
 
                 stripped = cypher.strip()
@@ -623,23 +690,23 @@ class CypherGenerator:
                     return None
 
                 logger.warning(
-                    f"Invalid Cypher on attempt {attempt}/{Config.RETRY_ATTEMPTS}: "
+                    f"Invalid Cypher on attempt {attempt}/{cfg.retry_attempts}: "
                     f"'{stripped}' for {metadata.name}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"API error on attempt {attempt}/{Config.RETRY_ATTEMPTS} "
+                    f"API error on attempt {attempt}/{cfg.retry_attempts} "
                     f"for {metadata.name}: {e}"
                 )
 
             # Back off before next attempt (skip sleep on last attempt)
-            if attempt < Config.RETRY_ATTEMPTS:
-                backoff = Config.RETRY_BACKOFF_BASE ** (attempt - 1)
+            if attempt < cfg.retry_attempts:
+                backoff = cfg.retry_backoff_base ** (attempt - 1)
                 time.sleep(backoff)
 
         # All attempts exhausted — deterministic fallback
         logger.error(
-            f"All {Config.RETRY_ATTEMPTS} attempts failed for {metadata.name}. "
+            f"All {cfg.retry_attempts} attempts failed for {metadata.name}. "
             "Using rule-based fallback."
         )
         return self._generate_fallback_cypher(metadata)
@@ -647,13 +714,16 @@ class CypherGenerator:
     def translate_query(self, natural_query: str) -> str:
         """Translate a natural-language query to a Cypher pattern."""
         import time
-        for attempt in range(1, Config.RETRY_ATTEMPTS + 1):
+
+        cfg = self._effective_config
+        for attempt in range(1, cfg.retry_attempts + 1):
             try:
-                pattern = self.llm.complete(
+                pattern = self._ensure_llm().complete(
                     system=Prompts.QUERY_TRANSLATION_SYSTEM,
                     user_message=Prompts.QUERY_TRANSLATION_USER.format(
                         query=natural_query,
                     ),
+                    max_tokens=cfg.llm_max_tokens,
                     temperature=0.0,
                 )
                 return (
@@ -662,12 +732,12 @@ class CypherGenerator:
                     else "*:*_*--*"
                 )
             except Exception as e:
-                if attempt >= Config.RETRY_ATTEMPTS:
+                if attempt >= cfg.retry_attempts:
                     logger.error(
                         f"Query translation error after {attempt} attempts: {e}"
                     )
                     break
-                backoff = Config.RETRY_BACKOFF_BASE ** (attempt - 1)
+                backoff = cfg.retry_backoff_base ** (attempt - 1)
                 logger.warning(
                     f"Query translation error on attempt {attempt}: {e}. "
                     f"Retrying in {backoff:.1f}s..."
@@ -769,7 +839,7 @@ class CypherGenerator:
 # Utility Functions
 # =============================================================================
 
-def scan_directory(root_path: Path) -> List[Path]:
+def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[Path]:
     """
     Recursively scan for Python source files (.py).
 
@@ -777,14 +847,15 @@ def scan_directory(root_path: Path) -> List[Path]:
     excluded subtrees (e.g. ``.git/``, ``__pycache__/``) are never
     entered — a significant speedup on large repositories.
 
-    Respects ``Config.TARGET_EXTENSIONS`` and ``Config.EXCLUDE_DIRS``.
+    Respects ``config.target_extensions`` and ``config.exclude_dirs``.
     """
     import os
 
+    cfg = config or SymdexConfig.from_env()
     source_files: List[Path] = []
-    exclude = Config.EXCLUDE_DIRS        # frozenset — O(1) lookups
-    extensions = Config.TARGET_EXTENSIONS  # frozenset — O(1) lookups
-    max_bytes = Config.MAX_FILE_SIZE_MB * 1024 * 1024
+    exclude = cfg.exclude_dirs            # frozenset — O(1) lookups
+    extensions = cfg.target_extensions     # frozenset — O(1) lookups
+    max_bytes = cfg.max_file_size_mb * 1024 * 1024
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         # ── Prune excluded directories IN-PLACE so os.walk never
@@ -854,6 +925,7 @@ def calculate_search_score(
     tags: List[str],
     query: str,
     function_name: str = "",
+    config: SymdexConfig | None = None,
 ) -> float:
     """
     Calculate relevance score for a search result.
@@ -865,11 +937,12 @@ def calculate_search_score(
       - Tag overlap with query words
       - Function name overlap with query words
     """
+    cfg = config or SymdexConfig.from_env()
     score = 0.0
-    weights = Config.SEARCH_RANKING_WEIGHTS
+    weights = cfg.search_ranking_weights
     
-    # Use centralized stop words from Config
-    stop_words = Config.STOP_WORDS
+    # Use centralized stop words from config
+    stop_words = cfg.stop_words
     
     pattern_parts = cypher_pattern.split(':')
     result_parts = result_cypher.split(':')

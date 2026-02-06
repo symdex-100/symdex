@@ -2,9 +2,9 @@
 
 <div align="center">
 
-![Symdex Robot](./docs/symdex-robot.png)
+![Symdex Robot](./docs/symdex-100.png)
 
-*A cute retro robot navigating an 80s pixel art cityscape — your AI companion for code exploration*
+*smydex-100 - your AI companion for code exploration*
 
 </div>
 
@@ -220,7 +220,11 @@ Where $[\text{x}]$ is 1 if matched, 0 otherwise (with partial matching for subst
 ### Install
 
 ```bash
+# Published package (once available on PyPI)
 pip install symdex-100
+
+# Local development (from source — see "Local Development" below)
+pip install -e ".[all]"
 ```
 
 ### Set API Key
@@ -236,20 +240,13 @@ export OPENAI_API_KEY="sk-..."
 
 Supports **Anthropic Claude** (default), **OpenAI GPT**, or **Google Gemini**.
 
-### Index Your Project
+### CLI Usage
 
 ```bash
+# Index a project
 symdex index ./my-project
-```
 
-Creates `.symdex/index.db` (SQLite). Source files are **never modified**.
-
-**Indexing speed:** ~150 functions/minute (Anthropic Haiku), ~500 functions/minute (local LLM with Ollama).
-
-### Search
-
-```bash
-# Natural language
+# Natural language search
 symdex search "where do we validate user passwords"
 
 # Direct Cypher (skip LLM translation)
@@ -260,12 +257,81 @@ symdex search "async email" -n 20 -p 5
 
 # JSON output (for scripting)
 symdex search "delete directory" --format json | jq '.[] | .file_path'
+
+# Check statistics
+symdex stats
 ```
 
-### Check Statistics
+Creates `.symdex/index.db` (SQLite). Source files are **never modified**.
 
-```bash
-symdex stats
+### Python API
+
+Symdex can be used as a library in your own applications — no CLI needed.
+
+```python
+from symdex import Symdex
+
+# Create a client (reads API key from environment)
+client = Symdex()
+
+# Index a project
+result = client.index("./my-project")
+print(f"Indexed {result.functions_indexed} functions in {result.files_scanned} files")
+
+# Search by intent
+hits = client.search("validate user tokens", path="./my-project")
+for hit in hits:
+    print(f"  {hit.function_name} @ {hit.file_path}:{hit.line_start}  [{hit.cypher}]")
+
+# Search by Cypher pattern (no LLM needed)
+hits = client.search_by_cypher("SEC:VAL_*--*", path="./my-project")
+
+# Get index statistics
+stats = client.stats("./my-project")
+print(f"{stats['indexed_files']} files, {stats['indexed_functions']} functions")
+```
+
+**With explicit configuration** (no environment variables needed):
+
+```python
+from symdex import Symdex, SymdexConfig
+
+config = SymdexConfig(
+    llm_provider="openai",
+    openai_api_key="sk-...",
+    openai_model="gpt-4o-mini",
+    max_search_results=10,
+    min_search_score=3.0,
+)
+client = Symdex(config=config)
+```
+
+**Async support** (for FastAPI, Django async views, etc.):
+
+```python
+from symdex import Symdex
+
+client = Symdex()
+
+# All operations have async variants
+result = await client.aindex("./my-project")
+hits   = await client.asearch("validate tokens", path="./my-project")
+stats  = await client.astats("./my-project")
+```
+
+**Error handling:**
+
+```python
+from symdex import Symdex, IndexNotFoundError, ConfigError
+
+client = Symdex()
+
+try:
+    hits = client.search("validate user")
+except IndexNotFoundError:
+    print("Run client.index() first!")
+except ConfigError:
+    print("Check your API key configuration")
 ```
 
 ---
@@ -369,7 +435,7 @@ symdex stats
 
 ## MCP Server (for AI Agents)
 
-Symdex provides an MCP (Model Context Protocol) server so AI agents can search your codebase natively.
+Symdex provides a full MCP (Model Context Protocol) server with **tools**, **resources**, and **prompt templates** so AI agents can search your codebase natively.
 
 ### Setup (Cursor)
 
@@ -388,16 +454,40 @@ Add to `.cursor/mcp_settings.json`:
 
 ### Available Tools
 
+| Tool | Description |
+|------|-------------|
+| `search_codebase(query, strategy, max_results)` | Natural-language or Cypher pattern search |
+| `search_by_cypher(cypher_pattern, max_results)` | Direct Cypher pattern lookup (no LLM) |
+| `index_directory(path, force)` | Build or refresh the sidecar index |
+| `get_index_stats(path)` | File and function counts |
+| `health()` | Server status, provider, model info |
+
+### Resources (read-only data)
+
+| URI | Description |
+|-----|-------------|
+| `symdex://schema/domains` | Domain codes and descriptions |
+| `symdex://schema/actions` | Action codes and descriptions |
+| `symdex://schema/patterns` | Pattern codes and descriptions |
+| `symdex://schema/full` | Complete Cypher-100 schema with common object codes |
+
+### Prompt Templates
+
+| Prompt | Description |
+|--------|-------------|
+| `find_security_functions(path)` | Audit all security-related functions |
+| `audit_domain(domain, path)` | Audit all functions in a specific domain |
+| `explore_codebase(path)` | High-level architecture overview via domain stats |
+
+### Programmatic MCP Server Creation
+
 ```python
-# Natural language search
-search_codebase(query: str, max_results: int = 10) -> List[Function]
+from symdex.mcp.server import create_server
+from symdex.core.config import SymdexConfig
 
-# Direct Cypher pattern
-search_by_cypher(pattern: str, max_results: int = 10) -> List[Function]
-
-# Index management
-index_directory(path: str, force: bool = False) -> Dict[str, int]
-get_index_stats(path: str = ".") -> Dict[str, int]
+config = SymdexConfig(llm_provider="openai", openai_api_key="sk-...")
+server = create_server(config=config)
+server.run(transport="stdio")
 ```
 
 **Agent workflow:**
@@ -530,7 +620,7 @@ docker run -v /host/project:/data symdex-100 \
 
 ## Roadmap
 
-### v1.0 (Current) — Python Foundation
+### v1.0 — Python Foundation
 - ✅ Python AST-based extraction
 - ✅ Multi-lane search with unified scoring
 - ✅ SQLite sidecar index
@@ -538,13 +628,26 @@ docker run -v /host/project:/data symdex-100 \
 - ✅ Interactive CLI with pagination
 - ✅ Sub-second search on 10K+ functions
 
-### v1.1 — Enhanced Intelligence
+### v1.1 (Current) — Product-Grade API
+- ✅ Instance-based `SymdexConfig` (replaces global config — multi-tenant safe)
+- ✅ `Symdex` client facade — single entry point for programmatic use
+- ✅ Async API (`aindex`, `asearch`, `astats` via `asyncio.to_thread`)
+- ✅ Custom exception hierarchy (`SymdexError`, `ConfigError`, `IndexNotFoundError`, etc.)
+- ✅ Lazy LLM initialization (search without API key for direct/keyword strategies)
+- ✅ `IndexingPipeline.run()` returns typed `IndexResult`
+- ✅ No import-time side effects (safe to `import symdex` as a library)
+- ✅ Thread-local SQLite connections in `CypherCache`
+- ✅ MCP resources (Cypher schema), prompt templates, health endpoint
+- ✅ CLI decoupled from core (instance-based config throughout)
+- ✅ Legacy CLI code removed from core modules
+
+### v1.2 — Enhanced Intelligence
 - 🔄 Local LLM support (Ollama, llama.cpp)
 - 🔄 Vector embeddings for "find similar" queries
 - 🔄 Pre-commit hook for automatic re-indexing
 - 🔄 VS Code extension
 
-### v1.2 — Multi-Language Support
+### v1.3 — Multi-Language Support
 - 📋 JavaScript / TypeScript
 - 📋 Go, Rust, Java
 - 📋 C / C++
@@ -554,6 +657,8 @@ docker run -v /host/project:/data symdex-100 \
 - 📋 Code duplication detection via Cypher similarity
 - 📋 Semantic diff (compare Cyphers across branches)
 - 📋 Query optimization hints (suggest better Cypher patterns)
+- 📋 Native async LLM providers (replace `to_thread` with SDK async clients)
+- 📋 REST/gRPC API server for remote deployments
 
 ---
 
@@ -579,6 +684,15 @@ A: Embeddings require vector search (expensive, opaque). Cyphers use structured 
 
 **Q: Can I customize the Cypher schema?**  
 A: Yes. Edit `config.py` → `CypherSchema.DOMAINS/ACTIONS/PATTERNS`. Re-index with `--force`.
+
+**Q: Can I use Symdex as a library in my own product?**  
+A: Yes. `from symdex import Symdex` gives you a clean, instance-based API. Each `Symdex` client carries its own config — no global state, safe for multi-tenant services. See the "Python API" section above.
+
+**Q: Do I need to publish Symdex to PyPI to use the API?**  
+A: No. Install from source with `pip install -e ".[all]"` and it's importable immediately. See "Local Development" above.
+
+**Q: Does the API support async?**  
+A: Yes. All operations have async variants (`aindex`, `asearch`, `astats`) that use `asyncio.to_thread()`. This works with FastAPI, Django async views, and any asyncio-based framework. Native async LLM providers are planned for v2.0.
 
 ---
 
@@ -614,6 +728,96 @@ A: Yes. Edit `config.py` → `CypherSchema.DOMAINS/ACTIONS/PATTERNS`. Re-index w
 
 ---
 
+## Local Development
+
+You can use Symdex as a library **without publishing it to PyPI** by installing in editable (development) mode. This is how you test the API locally.
+
+### 1. Install in editable mode
+
+```bash
+# Clone the repo
+git clone https://github.com/yourusername/symdex-100.git
+cd symdex-100
+
+# Create and activate a virtual environment
+python -m venv .venv
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# Linux/Mac:
+source .venv/bin/activate
+
+# Install in editable mode with all dependencies
+pip install -e ".[all]"
+```
+
+The `-e` flag ("editable") symlinks the package into your environment. Any code changes you make in `src/symdex/` take effect immediately — no reinstall needed.
+
+### 2. Verify the install
+
+```bash
+# CLI should work
+symdex --version
+
+# Python API should be importable
+python -c "from symdex import Symdex, SymdexConfig; print('OK')"
+```
+
+### 3. Test the API in a Python script or REPL
+
+```python
+from symdex import Symdex, SymdexConfig
+
+# Option A: reads ANTHROPIC_API_KEY (etc.) from environment
+client = Symdex()
+
+# Option B: explicit config (no env vars needed)
+client = Symdex(config=SymdexConfig(
+    llm_provider="anthropic",
+    anthropic_api_key="sk-ant-your-key-here",
+))
+
+# Index the symdex project itself as a test
+result = client.index(".")
+print(result)  # IndexResult(files_scanned=..., functions_indexed=..., ...)
+
+# Search it
+hits = client.search("validate cypher", path=".")
+for h in hits:
+    print(f"  {h.function_name}  {h.cypher}  score={h.score:.1f}")
+
+# Direct pattern search (no LLM call needed)
+hits = client.search_by_cypher("*:VAL_*--*", path=".")
+```
+
+### 4. Use from another local project
+
+If you have a **separate** project that wants to use Symdex as a dependency:
+
+```bash
+# From your other project's venv:
+pip install -e /path/to/symdex-100
+
+# Or with pip's path syntax in requirements.txt:
+# -e /path/to/symdex-100
+```
+
+Now `from symdex import Symdex` works in that project, and changes to the Symdex source are reflected immediately.
+
+### 5. Run the test suite
+
+```bash
+# All tests
+pytest tests/ -v
+
+# Specific test file
+pytest tests/test_config.py -v
+
+# With coverage (if installed)
+pytest tests/ --cov=symdex --cov-report=term-missing
+```
+
+---
+
 ## Contributing
 
 We welcome contributions! Focus areas:
@@ -621,15 +825,16 @@ We welcome contributions! Focus areas:
 1. **Search relevance** — Improve scoring algorithm, add query expansion
 2. **Performance** — Optimize SQLite queries, batch LLM calls
 3. **LLM providers** — Add Ollama, Together AI, local models
-4. **Language support** — JavaScript/TypeScript extractors (v1.2)
+4. **Language support** — JavaScript/TypeScript extractors (v1.3)
 5. **IDE plugins** — VS Code, JetBrains extensions
+6. **API integrations** — REST wrapper, Django/FastAPI middleware
 
 **Setup:**
 
 ```bash
 git clone https://github.com/yourusername/symdex-100.git
 cd symdex-100
-pip install -e ".[dev]"
+pip install -e ".[all]"
 pytest tests/
 ```
 

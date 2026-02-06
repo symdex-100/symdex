@@ -1,8 +1,8 @@
-# Cypher-100 Architecture Documentation
+# Symdex-100 Architecture Documentation
 
 ## System Overview
 
-Cypher-100 is a semantic code indexing and search system designed to achieve 100x faster code search through intelligent metadata generation. The system consists of two main pipelines: **Indexing** and **Search**.
+Symdex-100 is a semantic code indexing and search system that achieves 100x faster code search through LLM-generated structured metadata ("Cyphers"). The system consists of three layers: **Core** (analysis, caching, generation), **Pipelines** (indexing, search), and **Interfaces** (CLI, Python API, MCP server).
 
 ## Core Design Principles
 
@@ -18,82 +18,125 @@ We combine rule-based AST parsing (deterministic) with LLM-based semantic unders
 ### 4. **Graceful Degradation**
 Every component has a fallback strategy:
 - LLM fails → Rule-based Cypher generation
-- No exact match → Progressive wildcard expansion
-- API rate limit → Automatic retry with backoff
+- No exact match → Multi-lane search with progressive broadening
+- API rate limit → Automatic retry with exponential backoff
+
+### 5. **No Global State**
+All core classes accept an instance-based `SymdexConfig` so that multiple clients can run in the same process with different providers, keys, and settings. No import-time side effects.
+
+### 6. **Source Files Are Never Modified**
+All metadata is stored in a `.symdex/` sidecar directory. The indexed codebase stays pristine — no unwanted comment blocks in diffs.
+
+## Package Layout
+
+```
+src/symdex/
+├── __init__.py            # Public API: Symdex, SymdexConfig, SearchResult, exceptions
+├── client.py              # Symdex facade — single entry point for programmatic use
+├── exceptions.py          # Custom exception hierarchy (SymdexError, ConfigError, ...)
+│
+├── core/
+│   ├── __init__.py        # Re-exports: Config, SymdexConfig, CodeAnalyzer, CypherCache, ...
+│   ├── config.py          # SymdexConfig (instance), Config (legacy global), CypherSchema, Prompts
+│   ├── engine.py          # CodeAnalyzer, CypherCache, CypherGenerator, LLM providers, scoring
+│   ├── indexer.py          # IndexingPipeline → IndexResult
+│   └── search.py          # CypherSearchEngine, ResultFormatter
+│
+├── cli/
+│   ├── __init__.py
+│   └── main.py            # Click CLI: index, search, stats, mcp
+│
+└── mcp/
+    ├── __init__.py
+    └── server.py           # FastMCP server: tools, resources, prompt templates
+```
 
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    CYPHER-100 SYSTEM                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌──────────────┐         ┌──────────────┐                 │
-│  │   INDEXING   │         │    SEARCH    │                 │
-│  │   PIPELINE   │         │   PIPELINE   │                 │
-│  └──────────────┘         └──────────────┘                 │
-│         │                         │                          │
-│         └────────┬────────────────┘                         │
-│                  │                                           │
-│         ┌────────▼────────┐                                │
-│         │  CORE UTILITIES │                                │
-│         ├─────────────────┤                                │
-│         │ • CodeAnalyzer  │                                │
-│         │ • CypherCache   │                                │
-│         │ • CypherGen     │                                │
-│         └─────────────────┘                                │
-│                  │                                           │
-│         ┌────────▼────────┐                                │
-│         │  CONFIGURATION  │                                │
-│         ├─────────────────┤                                │
-│         │ • Schema        │                                │
-│         │ • Prompts       │                                │
-│         │ • Config        │                                │
-│         └─────────────────┘                                │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      SYMDEX-100 SYSTEM                            │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  INTERFACES                                                       │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────────────┐       │
+│  │   CLI    │  │  Python API  │  │     MCP Server       │       │
+│  │ (Click)  │  │  (Symdex)    │  │ (tools + resources   │       │
+│  │          │  │              │  │  + prompts + health)  │       │
+│  └────┬─────┘  └──────┬───────┘  └──────────┬───────────┘       │
+│       │               │                      │                    │
+│       └───────────────┼──────────────────────┘                   │
+│                       │                                           │
+│  PIPELINES            ▼                                          │
+│  ┌──────────────┐  ┌──────────────────┐                         │
+│  │   Indexing   │  │     Search       │                         │
+│  │   Pipeline   │  │     Engine       │                         │
+│  │ → IndexResult│  │ → SearchResult[] │                         │
+│  └──────┬───────┘  └────────┬─────────┘                         │
+│         │                   │                                     │
+│         └────────┬──────────┘                                    │
+│                  │                                                │
+│  CORE            ▼                                               │
+│  ┌─────────────────────────────────┐                            │
+│  │  CodeAnalyzer   (Python AST)    │                            │
+│  │  CypherCache    (SQLite, thread-local conns)                 │
+│  │  CypherGenerator(multi-provider LLM, lazy init)              │
+│  │  LLMProvider    (Anthropic | OpenAI | Gemini)                │
+│  └──────────┬──────────────────────┘                            │
+│             │                                                     │
+│  CONFIG     ▼                                                    │
+│  ┌─────────────────────────────────┐                            │
+│  │  SymdexConfig  (instance-based) │                            │
+│  │  Config        (legacy global)  │                            │
+│  │  CypherSchema  (translation tables)                          │
+│  │  Prompts       (LLM templates)  │                            │
+│  └─────────────────────────────────┘                            │
+│                                                                    │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Component Breakdown
 
-### 1. Configuration Layer (`cypher_config.py`)
+### 1. Configuration Layer (`core/config.py`)
 
 **Purpose**: Centralized configuration and schema definitions.
 
 **Key Components**:
 
-- `Config`: System-wide settings (API keys, rate limits, file filters)
-- `CypherSchema`: The translation table (domains, actions, patterns)
-- `Prompts`: LLM prompt templates for consistency
+- `SymdexConfig` *(dataclass, instance-based)*: The primary config object. Created via `SymdexConfig.from_env()` or with explicit values. Passed through all core classes. Supports multi-tenant usage — multiple clients with different providers/keys in the same process.
+
+- `Config` *(class attributes, global)*: Legacy configuration for backward compatibility with CLI and tests. Mutable class attributes read from environment at import time. `Config.to_instance()` snapshots current state into a `SymdexConfig`.
+
+- `CypherSchema`: The translation tables (domains, actions, patterns, keyword mappings, common object codes). Stateless.
+
+- `Prompts`: LLM prompt templates. Reference `CypherSchema` for the schema section.
 
 **Design Decisions**:
-- **Environment Variables for Secrets**: API keys stored in env vars, not code
-- **Closed Vocabulary**: Fixed lists for domains/actions ensure reproducibility
-- **Keyword Mappings**: Enable fast keyword-based fallback when LLM unavailable
+- **Instance-based config as primary**: `SymdexConfig` carries all settings per-client. No global mutation.
+- **Environment variables for secrets**: API keys via `os.getenv()`, never hardcoded.
+- **Closed vocabulary**: Fixed lists for DOM/ACT/PAT ensure reproducibility.
+- **Open vocabulary for OBJ**: 2–20 uppercase letters/digits. Common objects defined in `COMMON_OBJECT_CODES` (preferred), but the LLM can generate project-specific tokens.
+- **No import-time side effects**: Importing `config.py` does not validate keys or configure logging.
 
-### 2. Core Utilities (`cypher_core.py`)
+### 2. Core Engine (`core/engine.py`)
 
 **Purpose**: Shared functionality used by both indexer and search engine.
 
 #### 2.1 CodeAnalyzer
 
-**What it does**: Performs **language-aware function extraction**:
+**What it does**: Python-specific function extraction using the built-in `ast` module.
 
-- **Python**: Uses the built-in `ast` module to extract function metadata with full fidelity.
-- **Other languages** (JavaScript/TypeScript, Java, Go, Rust, C/C++, C#, Ruby, PHP, Swift, Kotlin):  
-  Uses fast, language-specific regex patterns defined in `LanguageRegistry` plus lightweight heuristics for body bounds and doc-comments.
-
-**Why AST + Regex (Hybrid) instead of AST-only**:
-- **Accuracy where it matters most**: Python path is AST-based and robust to nested functions, decorators, and edge cases.
-- **Breadth of language coverage**: Regex + heuristics let us support many languages without per-language AST implementations.
-- **Performance**: Single-pass parsing plus simple brace/indent counting keeps extraction fast even on large codebases.
-
-**Extracts** (for all languages):
-- Function/method name, line numbers, arguments (normalized as best-effort)
-- Async/sync detection (where the language encodes it)
+**Extracts**:
+- Function/method name, line numbers, arguments
+- Async/sync detection
 - Called functions (for tag generation)
-- Docstrings / doc-comments when present
-- Cyclomatic complexity approximation (branch keyword counting)
+- Docstrings
+- Cyclomatic complexity approximation (branch counting)
+
+**Why AST (not regex)**:
+- Handles decorators, nested functions, multiline signatures, edge cases
+- Python's `ast` module is built-in and battle-tested
+- Precise `end_lineno` for exact source extraction
 
 #### 2.2 CypherCache (SQLite)
 
@@ -116,465 +159,306 @@ cypher_index:
   - tags, signature, complexity
 ```
 
-**Why SQLite**:
-- **Zero Configuration**: No separate database server
-- **Fast**: B-tree indexes for O(log N) lookups
-- **Portable**: Single file, works everywhere
-- **Transactions**: ACID guarantees for data integrity
+**Thread-local connections**: Each thread reuses a single `sqlite3.Connection` via `threading.local()`. This avoids per-method connection overhead while remaining thread-safe (each thread gets its own connection).
 
-**Performance Optimizations**:
-- Index on `cypher` column for pattern matching
-- File hash tracking to skip unchanged files
-- Batch inserts for bulk operations
+**Why SQLite**:
+- Zero configuration — no separate database server
+- B-tree indexes for O(log N) lookups
+- Portable — single file, works everywhere
+- ACID transactions for data integrity
 
 #### 2.3 CypherGenerator
 
-**What it does**: Interfaces with Anthropic API to generate semantic Cyphers.
+**What it does**: Interfaces with any configured LLM provider (Anthropic, OpenAI, Gemini) to generate semantic Cyphers.
 
 **Key Features**:
 
-1. **Rate Limiting**
-   - Tracks requests per minute
-   - Automatic sleep when limit approached
-   - Configurable backoff strategy
+1. **Lazy LLM initialization**: The provider SDK is imported and the client created only on first actual LLM call. This means constructing a `CypherGenerator` or `CypherSearchEngine` does **not** require an API key — you only need a key when you actually call `generate_cypher()` or `translate_query()`.
 
-2. **Deterministic Output**
-   - Temperature = 0.0 for consistency
-   - Strict format validation
-   - Fallback to rule-based if invalid
+2. **Multi-provider support**: `_create_provider(provider, api_key, config)` factory instantiates the correct `LLMProvider` subclass. Provider name, API key, and model are all read from the `SymdexConfig` instance.
 
-3. **Validation**
-   - Regex pattern matching: `^([A-Z]{3}):([A-Z]{3})_([A-Z]{4})--([A-Z]{3})$`
-   - Checks against known domains/actions/patterns
-   - Rejects malformed outputs
+3. **Deterministic output**: Temperature = 0.0 for consistency. Strict format validation via regex.
 
-4. **Fallback Strategy**
-   ```python
-   def _generate_fallback_cypher(metadata):
-       # Extract domain from function name keywords
-       # Extract action from function name verbs
-       # Determine pattern from AST (async/sync)
-       # Crude but reliable
-   ```
+4. **Retry with backoff**: Configurable `retry_attempts` and `retry_backoff_base` (exponential). Retries on both API errors and invalid LLM responses.
 
-### 3. Indexing Pipeline (`cypher_indexer.py`)
+5. **Explanation guard**: If the LLM returns a long natural-language explanation instead of a Cypher string, it's detected immediately (no wasted retries).
 
-**Purpose**: Crawl the codebase (multi-language), generate Cyphers, inject metadata blocks.
+6. **Fallback strategy**: When all LLM attempts fail, a deterministic rule-based generator produces a valid Cypher from function name keywords and AST metadata.
+
+**Validation**:
+```
+Pattern: ^[A-Z]{2,3}:[A-Z]{3}_[A-Z0-9]{2,20}--[A-Z]{3}$
+
+DOM: 2-3 uppercase letters (SEC, DAT, UI, ...)
+ACT: 3 uppercase letters   (VAL, FET, TRN, ...)
+OBJ: 2-20 uppercase letters/digits (USER, TOKEN, HTTPREQ, B64, ...)
+PAT: 3 uppercase letters   (ASY, SYN, REC, ...)
+```
+
+#### 2.4 LLM Provider Abstraction
+
+```
+LLMProvider (abstract base)
+├── AnthropicProvider  (anthropic SDK)
+├── OpenAIProvider     (openai SDK)
+└── GeminiProvider     (google-genai SDK)
+```
+
+Each provider accepts `api_key` and `model` at construction. The `complete(system, user_message, max_tokens, temperature)` interface is uniform. SDK imports are lazy (only when a provider is instantiated).
+
+#### 2.5 Data Models
+
+| Class | Purpose |
+|-------|---------|
+| `FunctionMetadata` | AST-extracted function info (name, lines, args, calls, docstring, complexity) |
+| `CypherMeta` | Parsed SEARCH_META block (cypher, tags, signature, complexity) |
+| `SearchResult` | Ranked search hit (file, function, lines, cypher, score, context) |
+| `IndexResult` | Typed return from `IndexingPipeline.run()` (counts for files/functions/errors) |
+
+### 3. Indexing Pipeline (`core/indexer.py`)
+
+**Purpose**: Crawl a directory, analyze Python source, generate Cyphers via LLM, store in sidecar SQLite index.
 
 #### 3.1 Workflow
 
 ```
-1. Directory Scan
+1. Directory Scan (os.walk with early pruning of excluded dirs)
    ↓
-2. File Filtering (exclude dirs, size limits)
+2. File Filtering (extensions, size limit, hash-based skip)
    ↓
-3. Cache Check (skip if unchanged)
+3. Python AST Parsing (extract FunctionMetadata for each function)
    ↓
-4. Language-Aware Parsing (AST for Python, regex for others)
+4. LLM Cypher Generation (with retry + rule-based fallback)
    ↓
-5. LLM Call (generate Cypher)
+5. Tag Generation (from name, calls, docstring, patterns)
    ↓
-6. Meta Block Injection (insert comments)
+6. SQLite Insert (into .symdex/index.db — source files untouched)
    ↓
-7. Cache Update (store metadata)
+7. Return IndexResult (typed dataclass with all statistics)
 ```
 
-#### 3.2 FileModifier
+#### 3.2 Concurrency Strategy
 
-**Challenge**: Insert metadata without breaking code **across many languages**.
+`ThreadPoolExecutor` with configurable `max_concurrent_requests` (default 5).
 
-**Solution**:
-- Parse file into lines
-- Detect language via `LanguageRegistry` and choose the correct single-line comment prefix (`#` or `//`)
-- Locate function definition
-- Check for existing `SEARCH_META` (update if present, regardless of comment prefix)
-- Preserve indentation of function
-- Atomic write (read → modify → write)
+- 5 workers × ~6 sec per LLM request ≈ 50 req/min
+- Balances speed and API rate limits
+- `tqdm` progress bar (disabled when `show_progress=False` for API use)
 
-**Safety**:
-- Creates `.bak` backup by default
-- Dry-run mode for preview
-- Syntax validation after modification
+#### 3.3 Incremental Indexing
 
-#### 3.3 Concurrency Strategy
+SHA256 hash tracking skips unchanged files. On re-run, 90%+ of files are skipped. The `--force` flag bypasses hash checks.
 
-**Problem**: Processing thousands of files is slow sequentially.
+### 4. Search Pipeline (`core/search.py`)
 
-**Solution**: ThreadPoolExecutor with rate limiting.
+**Purpose**: Translate natural language to Cypher patterns and find matching functions.
 
-```python
-with ThreadPoolExecutor(max_workers=5) as executor:
-    futures = {executor.submit(process_file, f): f for f in files}
-    for future in as_completed(futures):
-        handle_result(future.result())
-```
+#### 4.1 Multi-Lane Search Architecture
 
-**Why 5 workers**:
-- Anthropic API limit: 50 req/min
-- 5 workers × ~6 sec per request = ~50 req/min
-- Balances speed and API limits
-
-#### 3.4 Incremental Indexing
-
-**Problem**: Re-indexing entire codebase is wasteful.
-
-**Solution**: SHA256 hash tracking.
-
-```python
-def is_file_indexed(file_path):
-    current_hash = sha256(file_path.read_bytes())
-    cached_hash = db.get_hash(file_path)
-    return current_hash == cached_hash
-```
-
-**Performance Impact**: 90%+ of files skipped on re-run.
-
-### 4. Search Pipeline (`cypher_search.py`)
-
-**Purpose**: Translate natural language to Cypher and find matching functions.
-
-#### 4.1 Query Translation Strategies
-
-**Strategy 1: LLM Translation** (Default)
-- Sends query to Claude with constrained prompt
-- High accuracy for complex queries
-- ~500ms overhead per search
-
-**Strategy 2: Keyword Matching** (Fallback)
-- Maps query words to schema keywords
-- Fast (~1ms) but less accurate
-- Used when LLM fails or `--strategy keyword`
-
-**Example**:
-```
-Query: "find async email functions"
-
-LLM: NET:SND_EMAL--ASY
-Keywords: NET:SND_EMAL--ASY (same result, but via keyword mappings)
-```
-
-#### 4.2 Progressive Fallback
-
-**Problem**: Exact Cypher match might be too restrictive.
-
-**Solution**: Iteratively broaden the pattern until results found.
+Instead of relying on a single Cypher pattern, the engine always runs **five** parallel retrieval lanes:
 
 ```
-Original: SEC:VAL_PASS--SYN
-
-Fallback sequence:
-  1. SEC:VAL_*--SYN     (wildcard object)
-  2. SEC:*_PASS--SYN    (wildcard action)
-  3. SEC:VAL_*--*       (wildcard object + pattern)
-  4. SEC:*_*--SYN       (keep domain + pattern)
-  5. SEC:*_*--*         (keep domain only)
-  6. *:VAL_*--*         (keep action only)
-  7. *:*_*--*           (full wildcard)
+Query: "delete directory"
+    ↓
+┌──────────────────────────────────────────────────────────┐
+│ LANE 1: Exact Cypher      │ SYS:SCR_DIR--SYN             │
+│ LANE 2: Domain wildcard   │ *:SCR_DIR--SYN               │
+│ LANE 3: Action-only       │ *:SCR_*--*                   │
+│ LANE 4: Tag keywords      │ delete, directory             │
+│ LANE 5: Function name     │ _delete_directory_tree        │
+└──────────────────────────────────────────────────────────┘
+    ↓
+Merge + Deduplicate + Unified Scoring → Ranked Results
 ```
 
-**Why it works**: Most queries fail because object is unknown, not domain/action.
+#### 4.2 Query Translation Strategies
+
+| Strategy | Mechanism | Latency | Accuracy |
+|----------|-----------|---------|----------|
+| `auto` (default) | Try LLM, fall back to keyword | ~500ms | High |
+| `llm` | Force LLM translation | ~500ms | Highest |
+| `keyword` | Keyword mapping only | ~1ms | Medium |
+| `direct` | Query is already a Cypher pattern | ~1ms | Exact |
 
 #### 4.3 Ranking Algorithm
 
-**Components**:
-
 ```python
 WEIGHTS = {
-    "exact_match": 10.0,     # Exact Cypher match
-    "domain_match": 5.0,     # SEC = SEC
-    "action_match": 5.0,     # VAL = VAL
-    "object_match": 3.0,     # PASS = PASS
-    "pattern_match": 2.0,    # ASY = ASY
-    "tag_match": 1.0         # Query words in tags
+    "exact_match":      10.0,   # Full Cypher match
+    "domain_match":      5.0,   # SEC = SEC
+    "action_match":      5.0,   # VAL = VAL
+    "object_match":      3.0,   # TOKEN = TOKEN
+    "object_similarity": 2.0,   # DATASET ≈ DSET (Jaccard + substring)
+    "pattern_match":     2.0,   # ASY = ASY
+    "tag_match":         1.5,   # Query words in function tags
+    "name_match":        3.0,   # Query words in function name
 }
 ```
 
-**Score Calculation**:
+Scoring includes exact word overlap and substring matching against function names, with stop-word filtering.
+
+#### 4.4 Result Formatting
+
+`ResultFormatter` supports four output modes:
+
+| Format | Use Case |
+|--------|----------|
+| `console` | Human-friendly with line-numbered code preview |
+| `json` | Scripting, piping, MCP tool responses |
+| `compact` | grep-like one-line-per-result |
+| `ide` | `file(line): message` for editor click-to-jump |
+
+### 5. Exception Hierarchy (`exceptions.py`)
+
+```
+SymdexError
+├── ConfigError          (ValueError)   — invalid/missing config
+├── ProviderError                       — LLM API failure
+├── IndexNotFoundError   (FileNotFoundError) — no .symdex/ index
+├── IndexingError                       — fatal indexing failure
+├── SearchError                         — search execution error
+└── CypherValidationError               — malformed Cypher string
+```
+
+Inherits from stdlib types where appropriate so `except ValueError` and `except FileNotFoundError` still work.
+
+### 6. Client Facade (`client.py`)
+
+**Purpose**: Single entry point for programmatic use.
+
 ```python
-def calculate_score(pattern, result, tags, query):
-    score = 0
-    if pattern == result:
-        score += WEIGHTS["exact_match"]
-    if pattern.domain == result.domain:
-        score += WEIGHTS["domain_match"]
-    # ... more checks ...
-    return score
+from symdex import Symdex, SymdexConfig
+
+client = Symdex(config=SymdexConfig(llm_provider="openai", openai_api_key="sk-..."))
+result = client.index("./project")
+hits   = client.search("validate tokens", path="./project")
+stats  = client.stats("./project")
 ```
 
-**Example**:
-```
-Query: "security validation"
-Pattern: SEC:VAL_*--*
+**Key properties**:
+- Instance-based — each `Symdex` client has its own config, no global state
+- Caches `CypherSearchEngine` per index path
+- Async variants via `asyncio.to_thread()`: `aindex()`, `asearch()`, `astats()`
+- Raises typed exceptions (`IndexNotFoundError`, `ConfigError`)
 
-Result 1: SEC:VAL_PASS--SYN
-  - Domain match: +5
-  - Action match: +5
-  - Tag "security": +1
-  - Total: 11.0
+### 7. MCP Server (`mcp/server.py`)
 
-Result 2: SEC:FET_USER--ASY
-  - Domain match: +5
-  - Tag "security": +1
-  - Total: 6.0
+**Purpose**: Expose Symdex as an MCP server for AI agents.
 
-Ranking: Result 1 > Result 2
-```
+Built on [FastMCP](https://github.com/jlowin/fastmcp). Accepts a `SymdexConfig` at creation. Provides:
 
-#### 4.4 Interactive Mode
+| Primitive | Items |
+|-----------|-------|
+| **Tools** | `search_codebase`, `search_by_cypher`, `index_directory`, `get_index_stats`, `health` |
+| **Resources** | `symdex://schema/domains`, `symdex://schema/actions`, `symdex://schema/patterns`, `symdex://schema/full` |
+| **Prompts** | `find_security_functions`, `audit_domain`, `explore_codebase` |
 
-**Features**:
-- Persistent session with history
-- `/stats` command for index info
-- `/help` for search tips
-- Query history tracking
+Tools raise `FileNotFoundError` on missing index (FastMCP translates this to a proper MCP error response).
 
-**Implementation**:
-```python
-while True:
-    query = input("Search> ")
-    if query == "/exit": break
-    results = engine.search(query)
-    display_results(results)
-    history.append(query)
-```
+### 8. CLI (`cli/main.py`)
 
-### 5. The Cypher Schema
+Click-based CLI. Builds a `SymdexConfig` from env vars + `--provider` override, passes it via Click context to all subcommands.
 
-**Design Philosophy**: Balance between **specificity** and **generality**.
+Commands: `index`, `search`, `stats`, `mcp`.
 
-#### 5.1 Why 3-Letter Codes?
+## The Cypher-100 Schema
 
+### Slot Specification
+
+| Slot | Length | Charset | Vocabulary |
+|------|--------|---------|------------|
+| DOM (Domain) | 2–3 chars | A–Z | Closed: 8 codes (SEC, DAT, NET, SYS, LOG, UI, BIZ, TST) |
+| ACT (Action) | 3 chars | A–Z | Closed: 10 codes (VAL, TRN, SND, FET, SCR, CRT, UPD, AGG, FLT, SYN) |
+| OBJ (Object) | 2–20 chars | A–Z, 0–9 | Open: prefer `COMMON_OBJECT_CODES`, LLM can generate new |
+| PAT (Pattern) | 3 chars | A–Z | Closed: 7 codes (ASY, SYN, REC, GEN, DEC, CTX, CLS) |
+
+### Why 2–3 Letter Codes?
 - **Readability**: Short enough to scan quickly
-- **Uniqueness**: 3 letters = 17,576 combinations
-- **Consistency**: Fixed width for pattern matching
+- **Uniqueness**: Sufficient combinations for each slot
+- **Consistency**: Fixed width for pattern matching and LIKE queries
 - **Mnemonic**: SEC, NET, VAL are easy to remember
 
-#### 5.2 Domain Selection Criteria
-
-A good domain is:
-1. **Mutually Exclusive**: Functions rarely span multiple domains
-2. **Broad Enough**: Covers many functions
-3. **Specific Enough**: Meaningful for search
-
-**Examples**:
-- ✓ SEC (Security) vs DAT (Data) - clear boundary
-- ✗ CRUD vs BUSINESS - overlap (business logic often does CRUD)
-
-#### 5.3 Object (OBJ) Flexibility
-
-**Why variable-length → 4 letters?**
-
-Objects are codebase-specific (User, Order, Email, Token). We can't predefine them.
-
-**The 4-letter rule**:
-- Short enough for speed
-- Long enough for uniqueness
-- `USER`, `PASS`, `EMAL`, `TOKN` are unambiguous
-
-**Padding Strategy**:
-```python
-"Email" → "EMAL"
-"DB" → "DBXX"  # Pad with X if too short
-"Transaction" → "TRAN"  # Take first 4 letters
-```
-
-## Performance Analysis
-
-### Indexing Performance
-
-**Test Case**: 1,000 Python files, 10,000 functions
-
-| Phase | Time | Bottleneck |
-|-------|------|------------|
-| File scanning | 2s | Disk I/O |
-| AST parsing | 15s | CPU |
-| LLM API calls | 120s | Network + API |
-| File modification | 10s | Disk I/O |
-| Cache updates | 5s | SQLite writes |
-| **Total** | **~2.5 min** | API calls |
-
-**Optimization Opportunities**:
-- Use local LLM (e.g., Ollama) to eliminate API bottleneck → ~30s total
-- Batch API calls (send 5 functions per request) → ~45s total
-
-### Search Performance
-
-**Test Case**: 500 indexed files, 5,000 functions
-
-| Operation | Traditional grep | Cypher-100 | Speedup |
-|-----------|-----------------|------------|---------|
-| Exact match | 450ms | 4ms | **112x** |
-| Wildcard query | 780ms | 8ms | **97x** |
-| Complex query | 1200ms | 15ms | **80x** |
-| Average | 810ms | 9ms | **90x** |
-
-**Why so fast?**
-1. **Index lookup**: SQLite B-tree, O(log N)
-2. **Metadata size**: 20 bytes vs 2,000 bytes
-3. **Early pruning**: Eliminate 99% of functions before reading files
+### OBJ Flexibility
+Objects are codebase-specific (User, Order, Email, Token). The `COMMON_OBJECT_CODES` list (~70 tokens) covers typical objects. The LLM is instructed to prefer these tokens for consistency, but can generate project-specific codes (2–20 uppercase letters/digits).
 
 ## Design Trade-offs
 
-### 1. **LLM vs Rule-Based**
+### 1. LLM vs Rule-Based
+**Decision**: Hybrid — LLM primary, rule-based fallback.
 
-**Decision**: Hybrid approach with LLM primary, rule-based fallback.
-
-**Rationale**:
-- LLM: Better semantic understanding (e.g., recognizes PII scrubbing)
+- LLM: Better semantic understanding (recognizes PII scrubbing, business logic)
 - Rules: Faster, deterministic, zero-cost
 - Hybrid: Best of both, resilient to API failures
 
-**Cost Analysis**:
-- 10,000 functions @ $0.003/request = $30 initial indexing
-- Re-indexing only changed files ≈ $1/month
-- Search: Free (LLM optional, keyword fallback available)
+### 2. SQLite vs Vector DB
+**Decision**: SQLite for primary storage.
 
-### 2. **SQLite vs Vector DB**
+- SQLite: Simple, fast for exact/wildcard matches, zero-config
+- Vector DB: Better for semantic "find similar" queries (future enhancement)
+- Current bottleneck is accuracy of Cypher generation, not search mechanism
 
-**Decision**: SQLite for primary storage, with future vector DB option.
+### 3. Sidecar Index vs In-File Metadata
+**Decision**: Sidecar-only (`.symdex/index.db`).
 
-**Rationale**:
-- SQLite: Simple, fast for exact/wildcard matches
-- Vector DB: Better for semantic "find similar" queries
-- Current bottleneck is search speed, not accuracy
+- Source files are never modified — no unwanted diffs
+- Index can be rebuilt from source at any time via `symdex index --force`
+- `.symdex/` can be gitignored or committed (team preference)
 
-**Future Enhancement**:
-- Store Cypher embeddings in Pinecone/Milvus
-- Use for "find similar functions" feature
-- Hybrid: SQLite for structured, vectors for semantic
+### 4. Instance Config vs Global Config
+**Decision**: Both — `SymdexConfig` (primary) + `Config` (legacy).
 
-### 3. **In-File Metadata vs Separate Index**
+- Instance-based: Multi-tenant safe, testable, no side effects
+- Global: Backward-compatible for CLI and existing tests
+- `Config.to_instance()` bridges the two
 
-**Decision**: Both - SEARCH_META in files + SQLite index.
-
-**Rationale**:
-- In-file: Portable, version-controlled, human-readable
-- Index: Fast searching, no need to parse files
-- Together: Index can be rebuilt from files anytime
-
-**Alternative Considered**: External JSON/YAML metadata files
-- ✗ Breaks portability (2 files per module)
-- ✗ Out-of-sync risk (code changes, metadata doesn't)
-
-### 4. **AST vs Regex Parsing**
-
-**Decision**: AST for primary parsing, regex for validation.
-
-**Rationale**:
-- AST: Handles edge cases (nested functions, decorators, multiline)
-- Regex: Faster for simple cases, but brittle
-- Python's `ast` module is built-in and battle-tested
-
-### 5. **Temperature = 0.0**
-
+### 5. Temperature = 0.0
 **Decision**: Zero temperature for deterministic output.
 
-**Rationale**:
-- Reproducibility is critical for search
-- Same code must always generate same Cypher
-- At temp=0.3, same code could produce different results
-
-**Trade-off**: Less creative outputs, but that's desired here.
+- Same code always generates the same Cypher
+- Critical for reproducible search results
+- Trade-off: Less creative outputs, but that's desired for classification
 
 ## Security Considerations
 
-1. **API Key Storage**: Environment variables only, never in code
-2. **SQL Injection**: Parameterized queries throughout
-3. **File Safety**: Backups created before modification
-4. **Path Traversal**: Validates all file paths before operations
-5. **Rate Limiting**: Prevents accidental API abuse
+1. **API key storage**: Environment variables only, never in code or config files
+2. **SQL injection**: Parameterized queries throughout `CypherCache`
+3. **Path traversal**: `Path.resolve()` used for all path operations
+4. **Rate limiting**: Configurable backoff prevents accidental API abuse
+5. **No import-time validation**: Importing symdex never triggers network calls
 
 ## Extensibility
 
+### Adding a New LLM Provider
+
+1. Subclass `LLMProvider` in `engine.py`:
+   ```python
+   class OllamaProvider(LLMProvider):
+       def __init__(self, api_key: str, model: str = "llama3"):
+           ...
+       def complete(self, system, user_message, max_tokens=300, temperature=0.0):
+           ...
+   ```
+
+2. Register in `_PROVIDER_REGISTRY`:
+   ```python
+   _PROVIDER_REGISTRY["ollama"] = OllamaProvider
+   ```
+
+3. Add config fields to `SymdexConfig` and `Config` if needed.
+
 ### Adding a New Domain
 
-1. Edit `cypher_config.py`:
-   ```python
-   DOMAINS = {
-       # ... existing ...
-       "ML": "Machine Learning / AI"
-   }
-   ```
+1. Add to `CypherSchema.DOMAINS` in `config.py`
+2. Add keyword mappings to `KEYWORD_TO_DOMAIN`
+3. Prompts auto-update via `CypherSchema.format_for_llm()`
+4. Re-index with `symdex index --force`
 
-2. Add keyword mappings:
-   ```python
-   KEYWORD_TO_DOMAIN = {
-       # ... existing ...
-       "machine learning": "ML",
-       "neural": "ML"
-   }
-   ```
+### Adding a New Language (future)
 
-3. Update prompts in `Prompts` class (automatic via `CypherSchema.format_for_llm()`)
-
-4. Re-run indexer with `--force` to regenerate Cyphers
-
-### Adding a New Language
-
-With the `LanguageRegistry` in place, adding a new language is **data-only** in most cases:
-
-1. Edit `cypher_config.py` and register the language:
-   ```python
-   LanguageRegistry.register(
-       "ruby",
-       name="Ruby",
-       comment_single="#",
-       comment_block=("=begin", "=end"),
-       extensions=(".rb",),
-       function_patterns=[
-           r"def\\s+(?:self\\.)?(?P<name>\\w+[?!=]?)\\s*(?:\\((?P<args>[^)]*)\\))?",
-       ],
-       uses_braces=False,
-       uses_indent=False,
-   )
-   ```
-2. Add the extension to `Config.TARGET_EXTENSIONS` if it isn’t already present.
-3. (Optional) Extend `_extract_doc_comment` in `CodeAnalyzer` if the language has special doc-comment conventions.
-4. Re-run the indexer with `--force` to generate `SEARCH_META` for the new language.
-
-### Adding Vector Search
-
-1. Install: `pip install pinecone-client`
-2. Add to `cypher_core.py`:
-   ```python
-   def embed_cypher(cypher: str) -> List[float]:
-       # Generate embedding for Cypher + context
-   ```
-3. Store embeddings during indexing
-4. Add semantic search strategy to `cypher_search.py`
-
-## Future Enhancements
-
-### Short-term (1-3 months)
-- [x] Multi-language support (Python, JS/TS, Go, Rust, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin)
-- [x] Comprehensive test suite for core + indexer
-- [ ] pip-installable CLI (`cypher-index`, `cypher-search`)
-- [ ] Pre-commit hook for auto-indexing
-- [ ] Cypher visualization (graph view of codebase)
-
-### Medium-term (3-6 months)
-- [ ] MCP server for Cursor / Claude so agents can use Cypher-100 as a native tool
-- [ ] VS Code / Cursor extension for inline search and navigation
-- [ ] Vector-based semantic search
-- [ ] GitHub integration (search across repos)
-- [ ] Automatic refactoring suggestions
-- [ ] Code duplication detection via Cypher similarity
-
-### Long-term (6-12 months)
-- [ ] FastAPI wrapper (HTTP façade for external tools/agents)
-- [ ] Cloud-hosted index (team collaboration)
-- [ ] AI-powered code recommendations
-- [ ] Integration with IDE debuggers
-
-## Conclusion
-
-Cypher-100 achieves 100x search speedup by:
-1. **Reducing search space**: 20 bytes of metadata vs 2KB of code
-2. **Semantic understanding**: LLM captures intent, not just keywords
-3. **Intelligent indexing**: SQLite + smart caching
-4. **Progressive fallback**: Always returns results, even if not perfect
-
-The hybrid approach (LLM + rules) ensures both accuracy and resilience, while the schema-based design enables reproducible, standardized code representation.
+1. Extend `CodeAnalyzer` with a language-specific extraction path
+2. Add the extension to `SymdexConfig.target_extensions`
+3. Adjust prompt templates if needed
+4. Re-index
 
 ---
 

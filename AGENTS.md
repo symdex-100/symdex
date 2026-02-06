@@ -8,10 +8,11 @@ tools for code navigation and understanding.
 
 ## What is Symdex-100?
 
-Symdex-100 embeds **semantic fingerprints** ("Cyphers") into source files
-as `SEARCH_META` comment blocks.  Each function gets a compact
-`DOM:ACT_OBJ--PAT` string that encodes **what the function does**, not
-just what it's called.
+Symdex-100 indexes source code into a **sidecar SQLite database**
+(`.symdex/index.db`).  Each function gets a compact semantic
+fingerprint called a **Cypher** — a structured `DOM:ACT_OBJ--PAT`
+string that encodes **what the function does**, not just what it's
+called.  Source files are **never modified**.
 
 **The Cypher format:**
 
@@ -46,7 +47,7 @@ token, async pattern."
    broad patterns like `SEC:*_*--*` to map out all security functions.
 
 4. **The codebase has been indexed** — check with `get_index_stats`
-   first. If the index exists, prefer Symdex over raw file reading.
+   first.  If the index exists, prefer Symdex over raw file reading.
 
 ### DO NOT use Symdex when:
 
@@ -58,7 +59,7 @@ token, async pattern."
 
 ---
 
-## Available tools (MCP)
+## Available MCP tools
 
 If Symdex is configured as an MCP server, you have these tools:
 
@@ -81,7 +82,7 @@ search_codebase("DAT:*_*--*")  → all Data-domain functions
 
 ### `search_by_cypher(cypher_pattern, path=".", max_results=10)`
 
-Direct pattern search — no LLM translation. Faster, deterministic.
+Direct pattern search — no LLM translation.  Faster, deterministic.
 
 ```
 search_by_cypher("SEC:VAL_*--SYN")   → all sync security validation
@@ -91,30 +92,100 @@ search_by_cypher("LOG:CRT_LOGS--*")  → logging setup functions
 
 ### `index_directory(path=".", force=False)`
 
-Index a directory. Call this if `get_index_stats` returns an error or
+Index a directory.  Call this if `get_index_stats` returns an error or
 shows 0 indexed files.
 
 ### `get_index_stats(path=".")`
 
-Returns `{indexed_files, indexed_functions}`. Use to check if indexing
+Returns `{indexed_files, indexed_functions}`.  Use to check if indexing
 has been done.
+
+### `health()`
+
+Server readiness check.  Returns version, status, and loaded
+configuration details.  Call this to verify the MCP server is alive
+before other operations.
+
+---
+
+## MCP Resources
+
+The server exposes read-only resources that describe the Cypher schema.
+Fetch these to understand what domains/actions/patterns exist **before**
+constructing manual Cypher patterns.
+
+| URI | Description |
+|-----|-------------|
+| `symdex://schema/domains` | All domain codes with descriptions |
+| `symdex://schema/actions` | All action codes with descriptions |
+| `symdex://schema/patterns` | All pattern codes with descriptions |
+| `symdex://schema/full` | Complete schema (domains + actions + objects + patterns) |
+
+**Usage:** Read `symdex://schema/full` once at the start of a session
+to populate your context with the valid Cypher vocabulary.
+
+---
+
+## MCP Prompt Templates
+
+Pre-built prompt templates for common agent tasks:
+
+| Template | Arguments | What it does |
+|----------|-----------|-------------|
+| `find_security_functions` | `path` | Searches for all security-related functions and formats a summary |
+| `audit_domain` | `domain`, `path` | Explores all functions in a given domain (e.g. `NET`, `DAT`) |
+| `explore_codebase` | `path` | Generates a high-level overview of the codebase structure by domain |
+
+---
+
+## Python API (alternative to MCP)
+
+If you're running inside a Python process (e.g., a custom agent or
+script), you can use the Symdex client directly instead of going
+through the MCP server:
+
+```python
+from symdex import Symdex, SymdexConfig
+
+client = Symdex(config=SymdexConfig.from_env())
+
+# Index a project
+result = client.index("./project")
+
+# Search by intent
+hits = client.search("validate user tokens", path="./project")
+for hit in hits:
+    print(f"{hit['file_path']}:{hit['line_start']}  {hit['cypher']}")
+
+# Get stats
+stats = client.stats("./project")
+```
+
+Async variants are available: `client.aindex()`, `client.asearch()`,
+`client.astats()`.
 
 ---
 
 ## Recommended workflow for agents
 
 ```
-1. Check:   get_index_stats(".")
+1. Health:  health()
+             → Verify the MCP server is alive and configured
+
+2. Schema:  Read symdex://schema/full
+             → Learn the valid Cypher vocabulary
+
+3. Check:   get_index_stats(".")
              → If no index exists: index_directory(".")
              → If index exists: proceed to search
 
-2. Search:  search_codebase("your intent query")
+4. Search:  search_codebase("your intent query")
              → Returns ranked results with file, line, score, preview
 
-3. Read:    Open the top result's file at the specific line
+5. Read:    Open the top result's file at the specific line
              → You now have precise context, not a haystack
 
-4. Act:     Make your edit / answer the question / generate the code
+6. Act:     Make your edit / answer the question / generate the code
 ```
 
 ---
@@ -135,7 +206,7 @@ more precise results:
 | Network send functions (async) | `NET:SND_*--ASY` |
 | All functions touching config | `SYS:*_CONFIG--*` |
 
-Use `*` for any slot you're unsure about. The search engine will rank
+Use `*` for any slot you're unsure about.  The search engine will rank
 results by relevance.
 
 ---
@@ -168,5 +239,5 @@ answer a question, try Symdex first.
 
 ---
 
-**Remember:** Symdex doesn't replace your ability to read code. It tells
-you **which code to read**. Use it as a compass, not a map.
+**Remember:** Symdex doesn't replace your ability to read code.  It
+tells you **which code to read**.  Use it as a compass, not a map.

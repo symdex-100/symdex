@@ -1,9 +1,10 @@
 """
-Tests for symdex.core.config — CypherSchema, Config, Prompts.
+Tests for symdex.core.config — SymdexConfig, CypherSchema, Config, Prompts.
 """
 
 import pytest
-from symdex.core.config import Config, CypherSchema, Prompts
+from symdex.core.config import Config, CypherSchema, Prompts, SymdexConfig
+from symdex.exceptions import ConfigError
 
 
 # =============================================================================
@@ -153,3 +154,82 @@ class TestPrompts:
         )
         assert "Python" in rendered
         assert "def foo()" in rendered
+
+
+# =============================================================================
+# SymdexConfig (instance-based) tests
+# =============================================================================
+
+class TestSymdexConfig:
+    """Verify SymdexConfig dataclass and its methods."""
+
+    def test_defaults_match_config(self):
+        cfg = SymdexConfig()
+        assert cfg.llm_provider == "anthropic"
+        assert cfg.cypher_version == "1.0"
+        assert ".py" in cfg.target_extensions
+        assert "__pycache__" in cfg.exclude_dirs
+
+    def test_from_env_creates_valid_config(self):
+        cfg = SymdexConfig.from_env()
+        assert isinstance(cfg, SymdexConfig)
+        assert cfg.llm_provider in ("anthropic", "openai", "gemini")
+
+    def test_validate_rejects_unknown_provider(self):
+        cfg = SymdexConfig(llm_provider="nonexistent")
+        with pytest.raises(ConfigError, match="Unknown LLM provider"):
+            cfg.validate()
+
+    def test_validate_rejects_missing_key(self):
+        cfg = SymdexConfig(llm_provider="openai", openai_api_key=None)
+        with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
+            cfg.validate()
+
+    def test_validate_succeeds_with_key(self):
+        cfg = SymdexConfig(llm_provider="anthropic", anthropic_api_key="test-key")
+        assert cfg.validate() is True
+
+    def test_get_api_key_returns_correct_key(self):
+        cfg = SymdexConfig(
+            llm_provider="openai",
+            openai_api_key="sk-test",
+        )
+        assert cfg.get_api_key() == "sk-test"
+
+    def test_get_model_returns_correct_model(self):
+        cfg = SymdexConfig(llm_provider="gemini", gemini_model="custom-model")
+        assert cfg.get_model() == "custom-model"
+
+    def test_get_cache_path(self):
+        from pathlib import Path
+        cfg = SymdexConfig(cache_db_name="myindex.db")
+        result = cfg.get_cache_path(Path("/tmp/test"))
+        assert result == Path("/tmp/test/myindex.db")
+
+    def test_search_ranking_weights_are_independent(self):
+        """Each SymdexConfig instance should have its own weights dict."""
+        cfg1 = SymdexConfig()
+        cfg2 = SymdexConfig()
+        cfg1.search_ranking_weights["exact_match"] = 999.0
+        assert cfg2.search_ranking_weights["exact_match"] == 10.0
+
+
+class TestConfigToInstance:
+    """Verify Config.to_instance() snapshots global state correctly."""
+
+    def test_to_instance_returns_symdex_config(self):
+        cfg = Config.to_instance()
+        assert isinstance(cfg, SymdexConfig)
+
+    def test_to_instance_captures_provider(self):
+        original = Config.LLM_PROVIDER
+        try:
+            Config.LLM_PROVIDER = "gemini"
+            cfg = Config.to_instance()
+            assert cfg.llm_provider == "gemini"
+        finally:
+            Config.LLM_PROVIDER = original
+
+    def test_to_instance_captures_model(self):
+        cfg = Config.to_instance()
+        assert cfg.anthropic_model == Config.ANTHROPIC_MODEL

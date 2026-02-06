@@ -9,11 +9,165 @@ Production-ready with validation and security considerations.
 """
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 # =============================================================================
-# API Configuration
+# Instance-Based Configuration (preferred for new code)
+# =============================================================================
+
+@dataclass
+class SymdexConfig:
+    """
+    Instance-based configuration for Symdex-100.
+
+    Unlike the legacy :class:`Config` (global class attributes), each
+    ``SymdexConfig`` instance is self-contained and can be passed through
+    the call stack — enabling multi-tenant usage, testing, and embedding
+    into third-party products.
+
+    Create from environment variables::
+
+        config = SymdexConfig.from_env()
+
+    Or with explicit values::
+
+        config = SymdexConfig(llm_provider="openai", openai_api_key="sk-...")
+    """
+
+    # ── LLM Provider ──────────────────────────────────────────────
+    llm_provider: str = "anthropic"
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-haiku-4-5"
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-4o-mini"
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-2.0-flash"
+    llm_max_tokens: int = 300
+    llm_temperature: float = 0.0
+
+    # ── Rate Limiting ─────────────────────────────────────────────
+    max_requests_per_minute: int = 50
+    max_concurrent_requests: int = 5
+    retry_attempts: int = 3
+    retry_backoff_base: float = 2.0
+
+    # ── File Processing ───────────────────────────────────────────
+    target_extensions: frozenset = frozenset((".py",))
+    exclude_dirs: frozenset = frozenset((
+        "__pycache__", ".git", ".venv", "venv",
+        ".pytest_cache", "dist", "build", ".symdex",
+    ))
+    max_file_size_mb: int = 5
+
+    # ── Cypher Schema ─────────────────────────────────────────────
+    cypher_version: str = "1.0"
+
+    # ── Sidecar Index ─────────────────────────────────────────────
+    symdex_dir: str = ".symdex"
+    cache_db_name: str = "index.db"
+    cache_expiry_days: int = 30
+
+    # ── Search ────────────────────────────────────────────────────
+    max_search_results: int = 5
+    min_search_score: float = 5.0
+    stop_words: frozenset = frozenset({
+        "i", "a", "the", "is", "it", "do", "we", "my", "me", "an", "in",
+        "to", "for", "of", "and", "or", "on", "at", "by", "with", "from",
+        "that", "this", "where", "what", "how", "which", "show", "find",
+        "search", "look", "give", "list", "get", "see", "main", "function",
+        "code", "define", "does", "are", "was", "were", "been", "being",
+        "have", "has", "had", "having", "can", "could", "should", "would",
+    })
+    search_ranking_weights: dict = field(default_factory=lambda: {
+        "exact_match": 10.0,
+        "domain_match": 5.0,
+        "action_match": 5.0,
+        "object_match": 3.0,
+        "object_similarity": 2.0,
+        "pattern_match": 2.0,
+        "tag_match": 1.5,
+        "name_match": 3.0,
+    })
+
+    # ── Logging ───────────────────────────────────────────────────
+    log_level: str = "INFO"
+    log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    # ── Factory ───────────────────────────────────────────────────
+
+    @classmethod
+    def from_env(cls) -> "SymdexConfig":
+        """Build a config snapshot from current environment variables."""
+        return cls(
+            llm_provider=os.getenv("SYMDEX_LLM_PROVIDER", "anthropic").lower(),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            gemini_api_key=os.getenv("GEMINI_API_KEY"),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            llm_max_tokens=int(os.getenv("SYMDEX_MAX_TOKENS", "300")),
+            min_search_score=float(os.getenv("CYPHER_MIN_SCORE", "5.0")),
+            log_level=os.getenv("CYPHER_LOG_LEVEL", "INFO"),
+        )
+
+    # ── Validation & Accessors ────────────────────────────────────
+
+    def validate(self) -> bool:
+        """
+        Validate that the active LLM provider has an API key set.
+
+        Raises :class:`~symdex.exceptions.ConfigError` on failure.
+        """
+        from symdex.exceptions import ConfigError
+
+        key_map = {
+            "anthropic": ("ANTHROPIC_API_KEY", self.anthropic_api_key),
+            "openai":    ("OPENAI_API_KEY",    self.openai_api_key),
+            "gemini":    ("GEMINI_API_KEY",    self.gemini_api_key),
+        }
+
+        if self.llm_provider not in key_map:
+            raise ConfigError(
+                f"Unknown LLM provider '{self.llm_provider}'. "
+                f"Supported: {', '.join(key_map.keys())}.\n"
+                "  Set via: export SYMDEX_LLM_PROVIDER=anthropic"
+            )
+
+        env_name, value = key_map[self.llm_provider]
+        if not value:
+            raise ConfigError(
+                f"{env_name} not found (required by provider '{self.llm_provider}').\n"
+                f"  Windows (PowerShell): $env:{env_name}='your-key-here'\n"
+                f"  Linux/Mac: export {env_name}='your-key-here'"
+            )
+        return True
+
+    def get_api_key(self) -> str:
+        """Return the API key for the currently active provider."""
+        return {
+            "anthropic": self.anthropic_api_key,
+            "openai":    self.openai_api_key,
+            "gemini":    self.gemini_api_key,
+        }[self.llm_provider]
+
+    def get_model(self) -> str:
+        """Return the model name for the currently active provider."""
+        return {
+            "anthropic": self.anthropic_model,
+            "openai":    self.openai_model,
+            "gemini":    self.gemini_model,
+        }[self.llm_provider]
+
+    def get_cache_path(self, base_dir: Path) -> Path:
+        """Get the path to the cache database."""
+        return base_dir / self.cache_db_name
+
+
+# =============================================================================
+# Legacy Global Configuration (backward-compatible)
 # =============================================================================
 
 class Config:
@@ -152,6 +306,42 @@ class Config:
     def get_cache_path(cls, base_dir: Path) -> Path:
         """Get the path to the cache database."""
         return base_dir / cls.CACHE_DB_NAME
+
+    @classmethod
+    def to_instance(cls) -> "SymdexConfig":
+        """Snapshot current global Config state into a SymdexConfig instance.
+
+        Useful when you need to capture the current (possibly mutated)
+        global state and pass it to instance-based APIs.
+        """
+        return SymdexConfig(
+            llm_provider=cls.LLM_PROVIDER,
+            anthropic_api_key=cls.ANTHROPIC_API_KEY,
+            anthropic_model=cls.ANTHROPIC_MODEL,
+            openai_api_key=cls.OPENAI_API_KEY,
+            openai_model=cls.OPENAI_MODEL,
+            gemini_api_key=cls.GEMINI_API_KEY,
+            gemini_model=cls.GEMINI_MODEL,
+            llm_max_tokens=cls.LLM_MAX_TOKENS,
+            llm_temperature=cls.LLM_TEMPERATURE,
+            max_requests_per_minute=cls.MAX_REQUESTS_PER_MINUTE,
+            max_concurrent_requests=cls.MAX_CONCURRENT_REQUESTS,
+            retry_attempts=cls.RETRY_ATTEMPTS,
+            retry_backoff_base=cls.RETRY_BACKOFF_BASE,
+            target_extensions=cls.TARGET_EXTENSIONS,
+            exclude_dirs=cls.EXCLUDE_DIRS,
+            max_file_size_mb=cls.MAX_FILE_SIZE_MB,
+            cypher_version=cls.CYPHER_VERSION,
+            symdex_dir=cls.SYMDEX_DIR,
+            cache_db_name=cls.CACHE_DB_NAME,
+            cache_expiry_days=cls.CACHE_EXPIRY_DAYS,
+            max_search_results=cls.MAX_SEARCH_RESULTS,
+            min_search_score=cls.MIN_SEARCH_SCORE,
+            stop_words=cls.STOP_WORDS,
+            search_ranking_weights=cls.SEARCH_RANKING_WEIGHTS.copy(),
+            log_level=cls.LOG_LEVEL,
+            log_format=cls.LOG_FORMAT,
+        )
 
 
 # =============================================================================
@@ -377,10 +567,6 @@ User's search query: "{query}"
 Output only the Cypher pattern in format DOM:ACT_OBJ--PAT (use * for wildcards)"""
 
 
-# Validate on import if API key is required
-if __name__ != "__main__":
-    try:
-        Config.validate()
-    except ValueError:
-        # Allow import without key for documentation purposes
-        pass
+# NOTE: Import-time validation removed (v1.1).  Callers that need
+# validation should call ``Config.validate()`` or
+# ``SymdexConfig.from_env().validate()`` explicitly.

@@ -12,14 +12,12 @@ Usage::
 """
 
 import logging
-import os
-import sys
 import time
 from pathlib import Path
 
 import click
 
-from symdex.core.config import Config
+from symdex.core.config import Config, SymdexConfig
 from symdex.core.engine import CypherCache, scan_directory
 from symdex.core.search import CypherSearchEngine, ResultFormatter
 
@@ -28,13 +26,28 @@ from symdex.core.search import CypherSearchEngine, ResultFormatter
 # Logging helpers
 # ---------------------------------------------------------------------------
 
-def _configure_logging(verbose: bool) -> None:
+def _configure_logging(verbose: bool, config: SymdexConfig | None = None) -> None:
     """Set up logging for the CLI session."""
-    level = logging.DEBUG if verbose else getattr(logging, Config.LOG_LEVEL)
-    logging.basicConfig(level=level, format=Config.LOG_FORMAT)
+    cfg = config or SymdexConfig.from_env()
+    level = logging.DEBUG if verbose else getattr(logging, cfg.log_level)
+    logging.basicConfig(level=level, format=cfg.log_format)
     # Suppress noisy HTTP loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _build_config(provider: str | None = None) -> SymdexConfig:
+    """Create a SymdexConfig from env vars with an optional provider override."""
+    cfg = SymdexConfig.from_env()
+    if provider:
+        # Dataclass is not frozen, so we can override the provider
+        cfg = SymdexConfig(
+            **{
+                **{f.name: getattr(cfg, f.name) for f in cfg.__dataclass_fields__.values()},
+                "llm_provider": provider,
+            }
+        )
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +67,10 @@ def _configure_logging(verbose: bool) -> None:
 def cli(ctx: click.Context, provider: str | None):
     """Symdex-100 — Semantic fingerprints for 100x faster code search."""
     ctx.ensure_object(dict)
+    # Build an instance-based config and attach it to the Click context.
+    # All subcommands read it from ctx.obj["config"].
+    ctx.obj["config"] = _build_config(provider)
+    # Also update the legacy global Config for backward compat
     if provider:
         Config.LLM_PROVIDER = provider
 
@@ -69,15 +86,17 @@ def cli(ctx: click.Context, provider: str | None):
 @click.option("--force", is_flag=True, help="Force re-index all files, even if unchanged.")
 @click.option("--dry-run", is_flag=True, help="Analyse code without writing the index.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
-def index(directory: str, cache_dir: str | None, force: bool,
-          dry_run: bool, verbose: bool):
+@click.pass_context
+def index(ctx: click.Context, directory: str, cache_dir: str | None,
+          force: bool, dry_run: bool, verbose: bool):
     """Index Python source files in DIRECTORY and build a sidecar search index.
 
     Metadata is stored in a .symdex/ directory — source files are never
     modified. Python-only for v1 (multi-language support planned).
     """
-    _configure_logging(verbose)
-    _validate_api_key()
+    cfg: SymdexConfig = ctx.obj["config"]
+    _configure_logging(verbose, cfg)
+    _validate_config(cfg)
 
     root_dir = Path(directory).resolve()
     cache_path = Path(cache_dir).resolve() if cache_dir else None
@@ -91,11 +110,15 @@ def index(directory: str, cache_dir: str | None, force: bool,
             cache_dir=cache_path,
             dry_run=dry_run,
             force_reindex=force,
+            config=cfg,
+            show_progress=True,
         )
     except ImportError as exc:
         click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
+
     pipeline.run()
+    pipeline.print_statistics()
 
 
 # ---------------------------------------------------------------------------
@@ -119,16 +142,18 @@ def index(directory: str, cache_dir: str | None, force: bool,
 @click.option("--min-score", type=float, default=None,
               help="Minimum relevance score to display.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
-def search(query: str, cache_dir: str | None, fmt: str,
+@click.pass_context
+def search(ctx: click.Context, query: str, cache_dir: str | None, fmt: str,
            max_results: int | None, page_size: int | None,
            strategy: str, min_score: float | None, verbose: bool):
     """Search the Symdex index with a natural-language QUERY or Cypher pattern."""
-    _configure_logging(verbose)
-    _validate_api_key()
+    cfg: SymdexConfig = ctx.obj["config"]
+    _configure_logging(verbose, cfg)
+    _validate_config(cfg)
     t0 = time.perf_counter()
 
-    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / Config.SYMDEX_DIR)
-    db = Config.get_cache_path(cache_path)
+    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
+    db = cfg.get_cache_path(cache_path)
     if not db.exists():
         click.echo(f"Error: Index database not found at {db}", err=True)
         click.echo("Run 'symdex index <dir>' first to build the index.", err=True)
@@ -142,25 +167,24 @@ def search(query: str, cache_dir: str | None, fmt: str,
         raise SystemExit(1)
 
     try:
-        engine = CypherSearchEngine(cache_path)
+        engine = CypherSearchEngine(cache_path, config=cfg)
     except ImportError as exc:
         click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
     results = engine.search(query, strategy=strategy, max_results=max_results)
 
     # Apply minimum score filter
-    score_threshold = min_score if min_score is not None else Config.MIN_SEARCH_SCORE
+    score_threshold = min_score if min_score is not None else cfg.min_search_score
     results = [r for r in results if r.score >= score_threshold]
 
     # Calculate elapsed time for display
     elapsed = time.perf_counter() - t0
-    
+
     formatter = ResultFormatter()
 
     # ── Non-console formats: dump everything at once ─────────
     if fmt == "json":
         click.echo(formatter.format_json(results))
-        # Show timing for non-console formats at the bottom
         timing_str = f"{elapsed:.3f}".replace(',', '.')
         click.echo(f"  Completed in {timing_str} seconds")
     elif fmt == "compact":
@@ -172,7 +196,7 @@ def search(query: str, cache_dir: str | None, fmt: str,
         timing_str = f"{elapsed:.3f}".replace(',', '.')
         click.echo(f"  Completed in {timing_str} seconds")
     else:
-        # ── Console format with optional pagination (timing in header) ──────────
+        # ── Console format with optional pagination (timing in header) ──
         _display_console_results(results, formatter, page_size, elapsed)
 
 
@@ -201,7 +225,6 @@ def _display_console_results(
       q / quit   — stop
     """
     if not results or not page_size or page_size <= 0:
-        # No pagination — single dump (with timing in header)
         click.echo(formatter.format_console(results, elapsed_time=elapsed_time))
         return
 
@@ -215,7 +238,6 @@ def _display_console_results(
         end = min(start + page_size, total)
         page = results[start:end]
 
-        # Render the current page (with timing in header)
         click.echo(formatter.format_console(
             page,
             start_index=start + 1,
@@ -223,13 +245,11 @@ def _display_console_results(
             elapsed_time=elapsed_time,
         ))
 
-        # Last page — nothing more to navigate
         if total_pages == 1 or page_num == total_pages - 1:
             if total_pages > 1:
                 click.echo(f"  Page {page_num + 1}/{total_pages} (end)")
             break
 
-        # Interactive prompt
         try:
             hint = (
                 f"  Page {page_num + 1}/{total_pages}  "
@@ -249,17 +269,13 @@ def _display_console_results(
                 page_num -= 1
             else:
                 click.echo("  Already on the first page.")
-            # Re-render by continuing the loop (no page_num increment)
             continue
         elif cmd in ("p", "print"):
-            # Reprint current page (loop continues without increment)
             continue
         elif cmd in ("j", "json"):
             click.echo(formatter.format_json(page))
-            # Stay on the same page so the user can still navigate
             continue
         else:
-            # Enter / n / anything else → next page
             page_num += 1
 
 
@@ -270,10 +286,12 @@ def _display_console_results(
 @cli.command()
 @click.option("--cache-dir", type=click.Path(), default=None,
               help="Directory containing the index (default: ./.symdex).")
-def stats(cache_dir: str | None):
+@click.pass_context
+def stats(ctx: click.Context, cache_dir: str | None):
     """Show Symdex index statistics."""
-    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / Config.SYMDEX_DIR)
-    db = Config.get_cache_path(cache_path)
+    cfg: SymdexConfig = ctx.obj["config"]
+    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
+    db = cfg.get_cache_path(cache_path)
     if not db.exists():
         click.echo(f"No index found at {db}. Run 'symdex index' first.", err=True)
         raise SystemExit(1)
@@ -298,9 +316,11 @@ def stats(cache_dir: str | None):
 @click.option("--transport", type=click.Choice(["stdio", "sse"]),
               default="stdio", help="MCP transport (default: stdio).")
 @click.option("-v", "--verbose", is_flag=True)
-def mcp(transport: str, verbose: bool):
+@click.pass_context
+def mcp(ctx: click.Context, transport: str, verbose: bool):
     """Start the Symdex MCP server for Cursor / Claude integration."""
-    _configure_logging(verbose)
+    cfg: SymdexConfig = ctx.obj["config"]
+    _configure_logging(verbose, cfg)
     try:
         from symdex.mcp.server import create_server  # noqa: E402
     except ImportError:
@@ -311,7 +331,7 @@ def mcp(transport: str, verbose: bool):
         )
         raise SystemExit(1)
 
-    server = create_server()
+    server = create_server(config=cfg)
     server.run(transport=transport)
 
 
@@ -319,11 +339,11 @@ def mcp(transport: str, verbose: bool):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _validate_api_key() -> None:
+def _validate_config(cfg: SymdexConfig) -> None:
     """Ensure the API key for the active LLM provider is available."""
     try:
-        Config.validate()
-    except ValueError as exc:
+        cfg.validate()
+    except (ValueError, Exception) as exc:
         click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
 

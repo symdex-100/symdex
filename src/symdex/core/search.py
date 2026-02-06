@@ -11,21 +11,16 @@ Production-ready with:
 - Query caching and optimization
 """
 
-import argparse
 import json
 import logging
-import os
-import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
 import re
-import time
 
-from symdex.core.config import Config, CypherSchema
+from symdex.core.config import Config, CypherSchema, SymdexConfig
 from symdex.core.engine import (
     CypherCache, CypherGenerator, SearchResult,
-    calculate_search_score
+    calculate_search_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,9 +51,28 @@ class CypherSearchEngine:
     # Words stripped from queries before keyword / name / tag matching
     # (imported from Config to avoid duplication)
 
-    def __init__(self, cache_dir: Path):
-        self.cache = CypherCache(Config.get_cache_path(cache_dir))
-        self.generator = CypherGenerator()
+    def __init__(
+        self,
+        cache_dir: Path,
+        config: SymdexConfig | None = None,
+        generator: CypherGenerator | None = None,
+    ):
+        self._config = config or SymdexConfig.from_env()
+        self.cache = CypherCache(self._config.get_cache_path(cache_dir))
+        # Lazy generator — only created when an LLM-based search is needed
+        self._generator = generator
+
+    @property
+    def generator(self) -> CypherGenerator:
+        """Lazy LLM generator — created on first use that requires it."""
+        if self._generator is None:
+            self._generator = CypherGenerator(config=self._config)
+        return self._generator
+
+    @generator.setter
+    def generator(self, value: CypherGenerator):
+        """Allow direct injection (used by tests and the facade)."""
+        self._generator = value
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -75,7 +89,7 @@ class CypherSearchEngine:
         Returns:
             Ranked list of search results.
         """
-        max_results = max_results or Config.MAX_SEARCH_RESULTS
+        max_results = max_results or self._config.max_search_results
 
         # Determine Cypher pattern from the query
         if self._is_cypher_pattern(query):
@@ -98,7 +112,7 @@ class CypherSearchEngine:
 
     def search_by_tag(self, tag: str, max_results: int = None) -> List[SearchResult]:
         """Search for functions by tag."""
-        max_results = max_results or Config.MAX_SEARCH_RESULTS
+        max_results = max_results or self._config.max_search_results
         raw_results = self.cache.search_by_tags(tag, limit=max_results)
         return self._process_results(raw_results, None, tag)
 
@@ -151,8 +165,7 @@ class CypherSearchEngine:
 
         return f"{dom}:{act}_{obj}--{pat}"
 
-    @classmethod
-    def _extract_keywords(cls, query: str) -> List[str]:
+    def _extract_keywords(self, query: str) -> List[str]:
         """
         Extract meaningful keywords from a natural-language query.
 
@@ -161,7 +174,7 @@ class CypherSearchEngine:
         """
         return [
             w for w in query.lower().split()
-            if w not in Config.STOP_WORDS and len(w) > 2
+            if w not in self._config.stop_words and len(w) > 2
         ]
 
     # ── Multi-lane retrieval ──────────────────────────────────────
@@ -253,7 +266,8 @@ class CypherSearchEngine:
             if cypher_pattern:
                 score = calculate_search_score(
                     cypher_pattern, result['cypher'], tags, query,
-                    function_name=func_name
+                    function_name=func_name,
+                    config=self._config,
                 )
             else:
                 score = 1.0  # Base score for tag searches
@@ -456,298 +470,7 @@ class ResultFormatter:
         return "\n".join(lines)
 
 
-# =============================================================================
-# Interactive Search Mode
-# =============================================================================
 
-class InteractiveSearchSession:
-    """Interactive search session with query refinement."""
-    
-    def __init__(self, search_engine: CypherSearchEngine):
-        self.engine = search_engine
-        self.history = []
-    
-    def run(self):
-        """Run an interactive search session."""
-        print("=" * 80)
-        print("SYMDEX-100 INTERACTIVE SEARCH")
-        print("=" * 80)
-        print("Enter your search queries in natural language.")
-        print("Special commands:")
-        print("  /stats    - Show index statistics")
-        print("  /history  - Show search history")
-        print("  /help     - Show help")
-        print("  /exit     - Exit interactive mode")
-        print("=" * 80 + "\n")
-        
-        formatter = ResultFormatter()
-        
-        while True:
-            try:
-                query = input("Search> ").strip()
-                
-                if not query:
-                    continue
-                
-                # Handle special commands
-                if query == "/exit":
-                    print("Goodbye!")
-                    break
-                elif query == "/help":
-                    self._show_help()
-                    continue
-                elif query == "/stats":
-                    self._show_stats()
-                    continue
-                elif query == "/history":
-                    self._show_history()
-                    continue
-                
-                # Execute search
-                print(f"\nSearching for: {query}")
-                results = self.engine.search(query)
-                
-                # Display results
-                print(formatter.format_console(results, show_context=True))
-                
-                # Save to history
-                self.history.append({
-                    "query": query,
-                    "result_count": len(results)
-                })
-            
-            except KeyboardInterrupt:
-                print("\n\nInterrupted. Type /exit to quit or continue searching.")
-            except Exception as e:
-                logger.error(f"Search error: {e}")
-                print(f"Error: {e}")
-    
-    def _show_help(self):
-        """Show help information."""
-        print("\nCYPHER-100 SEARCH HELP")
-        print("-" * 80)
-        print("Search Syntax:")
-        print("  - Natural language: 'find async email functions'")
-        print("  - Direct Cypher: 'NET:SND_EMAL--ASY'")
-        print("  - Tag search: 'tag:async' or '#security'")
-        print("\nSearch Tips:")
-        print("  - Be specific about the action (send, validate, transform, etc.)")
-        print("  - Mention the domain if known (security, data, network, etc.)")
-        print("  - Include patterns for better results (async, recursive, etc.)")
-        print("-" * 80 + "\n")
-    
-    def _show_stats(self):
-        """Show index statistics."""
-        stats = self.engine.get_statistics()
-        print("\nINDEX STATISTICS")
-        print("-" * 80)
-        print(f"Indexed files:     {stats['indexed_files']}")
-        print(f"Indexed functions: {stats['indexed_functions']}")
-        print("-" * 80 + "\n")
-    
-    def _show_history(self):
-        """Show search history."""
-        if not self.history:
-            print("\nNo search history yet.\n")
-            return
-        
-        print("\nSEARCH HISTORY")
-        print("-" * 80)
-        for idx, entry in enumerate(self.history[-10:], 1):  # Last 10 queries
-            print(f"{idx}. '{entry['query']}' → {entry['result_count']} results")
-        print("-" * 80 + "\n")
-
-
-# =============================================================================
-# CLI Interface
-# =============================================================================
-
-def main():
-    """Main entry point for the search tool."""
-    start_time = time.perf_counter()
-    parser = argparse.ArgumentParser(
-        description="Symdex-100 Search Engine - Natural language code search",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Natural language search
-  python cypher_search.py "find async email functions"
-
-  # Direct Cypher search
-  python cypher_search.py "NET:SND_EMAL--ASY"
-
-  # Interactive mode
-  python cypher_search.py --interactive
-
-  # JSON output
-  python cypher_search.py "security validation" --format json
-
-  # Compact output (grep-like)
-  python cypher_search.py "data processing" --format compact
-        """
-    )
-    
-    parser.add_argument(
-        'query',
-        nargs='?',
-        help='Search query in natural language or Cypher format'
-    )
-    
-    default_cache_dir = Path(os.getenv("CYPHER_CACHE_DIR", Path.cwd()))
-    parser.add_argument(
-        '--cache-dir',
-        type=Path,
-        default=default_cache_dir,
-        help='Directory containing the cache database (default: CYPHER_CACHE_DIR or current directory)'
-    )
-    
-    parser.add_argument(
-        '--interactive', '-i',
-        action='store_true',
-        help='Start interactive search mode'
-    )
-    
-    parser.add_argument(
-        '--format', '-f',
-        choices=['console', 'json', 'compact', 'ide'],
-        default='console',
-        help='Output format (default: console)'
-    )
-    
-    parser.add_argument(
-        '--no-context',
-        action='store_true',
-        help='Do not show code context in results'
-    )
-    
-    parser.add_argument(
-        '--max-results', '-n',
-        type=int,
-        default=Config.MAX_SEARCH_RESULTS,
-        help=f'Maximum number of results (default: {Config.MAX_SEARCH_RESULTS})'
-    )
-    
-    parser.add_argument(
-        '--strategy',
-        choices=['auto', 'llm', 'keyword', 'direct'],
-        default='auto',
-        help='Search strategy (default: auto)'
-    )
-    
-    parser.add_argument(
-        '--stats',
-        action='store_true',
-        help='Show index statistics and exit'
-    )
-    
-    parser.add_argument(
-        '--min-score',
-        type=float,
-        default=Config.MIN_SEARCH_SCORE,
-        help=f'Minimum relevance score to display a result (default: {Config.MIN_SEARCH_SCORE})'
-    )
-    
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Enable verbose logging'
-    )
-    
-    args = parser.parse_args()
-    
-    # Configure logging
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Validate configuration
-    try:
-        Config.validate()
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(1)
-    
-    # Check if cache exists
-    cache_path = Config.get_cache_path(args.cache_dir)
-    if not cache_path.exists():
-        logger.error(f"Cache database not found: {cache_path}")
-        logger.error("Run cypher_indexer.py first to build the index.")
-        sys.exit(1)
-    
-    # Initialize search engine
-    try:
-        search_engine = CypherSearchEngine(args.cache_dir)
-    except Exception as e:
-        logger.error(f"Failed to initialize search engine: {e}")
-        sys.exit(1)
-    
-    # Show statistics
-    if args.stats:
-        stats = search_engine.get_statistics()
-        print("\nCYPHER INDEX STATISTICS")
-        print("=" * 60)
-        print(f"Indexed files:     {stats['indexed_files']}")
-        print(f"Indexed functions: {stats['indexed_functions']}")
-        print("=" * 60)
-        return
-    
-    # Interactive mode
-    if args.interactive:
-        session = InteractiveSearchSession(search_engine)
-        session.run()
-        return
-    
-    # Single query mode
-    if not args.query:
-        parser.print_help()
-        sys.exit(1)
-    
-    try:
-        # Execute search
-        results = search_engine.search(
-            args.query,
-            strategy=args.strategy,
-            max_results=args.max_results
-        )
-        
-        # Filter by minimum relevance score
-        min_score = args.min_score
-        total_before_filter = len(results)
-        results = [r for r in results if r.score >= min_score]
-        
-        if not results and total_before_filter > 0:
-            logger.info(
-                f"Found {total_before_filter} results but none above "
-                f"min score threshold ({min_score:.1f}). "
-                f"Use --min-score 0 to see all."
-            )
-        
-        # Format and display results
-        formatter = ResultFormatter()
-        
-        if args.format == 'json':
-            output = formatter.format_json(results)
-        elif args.format == 'compact':
-            output = formatter.format_compact(results)
-        elif args.format == 'ide':
-            output = formatter.format_ide(results)
-        else:
-            output = formatter.format_console(results, show_context=not args.no_context)
-        
-        print(output)
-
-        elapsed = time.perf_counter() - start_time
-        print(f"\n[INFO] Query completed in {elapsed:.3f}s")
-        
-        # Exit code based on results
-        sys.exit(0 if results else 1)
-    
-    except KeyboardInterrupt:
-        logger.warning("\nSearch interrupted by user")
-        sys.exit(130)
-    except Exception as e:
-        logger.error(f"Search error: {e}", exc_info=True)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+# NOTE: InteractiveSearchSession and legacy CLI main() removed in v1.1.
+# Use the ``symdex`` CLI (symdex.cli.main) or the Symdex facade
+# (symdex.client.Symdex) instead.

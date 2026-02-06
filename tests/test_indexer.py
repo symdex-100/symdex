@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import List
 
 import pytest
-from symdex.core.config import Config
-from symdex.core.engine import FunctionMetadata, CodeAnalyzer
+from symdex.core.config import Config, SymdexConfig
+from symdex.core.engine import FunctionMetadata, CodeAnalyzer, IndexResult
 from symdex.core.indexer import IndexingPipeline
 
 

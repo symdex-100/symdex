@@ -15,6 +15,7 @@ from symdex.core.engine import (
     CypherGenerator,
     CypherMeta,
     FunctionMetadata,
+    IndexResult,
     LLMProvider,
     _create_provider,
     _PROVIDER_REGISTRY,
