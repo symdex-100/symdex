@@ -1,8 +1,10 @@
 # Smithery project configuration for MCP server deployment.
 # See https://smithery.ai/docs/build/project-config/smithery-yaml
+# Session config: https://smithery.ai/docs/build/session-config (x-from for headers/query)
 
 runtime: "container"
 
+# MCP endpoint path (Streamable HTTP). Smithery Gateway connects to /mcp.
 startCommand:
   type: "http"
   configSchema:
@@ -11,11 +13,15 @@ startCommand:
       ANTHROPIC_API_KEY:
         type: "string"
         title: "Anthropic API Key"
-        description: "Optional. For LLM-based Cypher generation; omit to use rule-based fallback only."
+        description: "Optional. For LLM Cypher generation; omit for rule-only mode."
+        x-from:
+          header: "x-anthropic-api-key"
       OPENAI_API_KEY:
         type: "string"
         title: "OpenAI API Key"
-        description: "Optional. Alternative to Anthropic for Cypher generation."
+        description: "Optional. Alternative LLM provider."
+        x-from:
+          header: "x-openai-api-key"
       SYMDEX_LLM_PROVIDER:
         type: "string"
         title: "LLM Provider"

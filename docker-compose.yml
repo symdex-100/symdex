@@ -11,4 +11,4 @@ services:
     # Default: run MCP server (HTTP/Streamable) for Smithery / remote clients.
     # For CLI only: command: ["symdex", "--help"]
     # For stdio (local Cursor): command: ["symdex", "mcp", "--transport", "stdio"]
-    command: ["symdex", "mcp", "--transport", "http"]
+    command: ["symdex", "mcp", "--transport", "streamable-http"]

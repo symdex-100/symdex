@@ -9,9 +9,9 @@ templates** for common search workflows.
 
 Start with::
 
-    symdex mcp                      # stdio transport (default for Cursor)
-    symdex mcp --transport http     # HTTP (Streamable) for Smithery/remote clients
-    symdex mcp --transport sse      # SSE transport (legacy)
+    symdex mcp                              # stdio transport (default for Cursor)
+    symdex mcp --transport streamable-http  # HTTP (Streamable) for Smithery/remote
+    symdex mcp --transport sse              # SSE transport (legacy)
 
 Or programmatically::
 
@@ -318,12 +318,12 @@ SERVER_CARD = {
 
 def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: Any) -> None:
     """
-    Run the MCP server, adding server-card route for HTTP/SSE transports.
+    Run the MCP server, adding server-card route for HTTP transports.
 
-    For HTTP or SSE transport, intercepts FastMCP's app creation via uvicorn patching
+    For streamable-http or SSE transport, intercepts FastMCP's app creation via uvicorn patching
     to add /.well-known/mcp/server-card.json route for Smithery scanning.
     """
-    if transport not in ("http", "sse"):
+    if transport not in ("streamable-http", "http", "sse"):
         mcp_server.run(transport=transport, **kwargs)
         return
 

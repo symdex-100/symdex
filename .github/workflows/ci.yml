@@ -54,4 +54,4 @@ jobs:
 
       - name: Run MCP server (smoke test)
         run: |
-          docker run --rm -e MCP_TRANSPORT=http symdex-100:test timeout 3 symdex mcp --transport http || true
+          docker run --rm -e MCP_TRANSPORT=streamable-http symdex-100:test timeout 3 symdex mcp --transport streamable-http || true
