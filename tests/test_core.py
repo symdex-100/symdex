@@ -340,7 +340,7 @@ class TestLLMProviderAbstraction:
         mock_provider.complete.assert_called_once()
 
     def test_cypher_generator_translate_query_with_mock(self):
-        """translate_query delegates to the LLM provider."""
+        """translate_query returns a list of 1–3 Cypher patterns (tiered)."""
         mock_provider = MagicMock(spec=LLMProvider)
         mock_provider.complete.return_value = "SEC:VAL_*--*"
 
@@ -348,7 +348,7 @@ class TestLLMProviderAbstraction:
         gen.llm = mock_provider
 
         result = gen.translate_query("find security validation functions")
-        assert result == "SEC:VAL_*--*"
+        assert result == ["SEC:VAL_*--*"]
         mock_provider.complete.assert_called_once()
 
     def test_cypher_generator_falls_back_on_provider_error(self):

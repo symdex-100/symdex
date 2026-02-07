@@ -12,7 +12,6 @@ Usage::
 """
 
 import logging
-import time
 from pathlib import Path
 
 import click
@@ -150,7 +149,6 @@ def search(ctx: click.Context, query: str, cache_dir: str | None, fmt: str,
     cfg: SymdexConfig = ctx.obj["config"]
     _configure_logging(verbose, cfg)
     _validate_config(cfg)
-    t0 = time.perf_counter()
 
     cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
     db = cfg.get_cache_path(cache_path)
@@ -177,8 +175,8 @@ def search(ctx: click.Context, query: str, cache_dir: str | None, fmt: str,
     score_threshold = min_score if min_score is not None else cfg.min_search_score
     results = [r for r in results if r.score >= score_threshold]
 
-    # Calculate elapsed time for display
-    elapsed = time.perf_counter() - t0
+    # Elapsed time: DB + scoring + context only (excludes LLM translation)
+    elapsed = engine.last_search_db_elapsed_seconds
 
     formatter = ResultFormatter()
 

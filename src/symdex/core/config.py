@@ -71,6 +71,7 @@ class SymdexConfig:
 
     # ── Search ────────────────────────────────────────────────────
     max_search_results: int = 5
+    max_search_candidates: int = 200  # Cap merged candidates before scoring (0 = no cap)
     min_search_score: float = 5.0
     stop_words: frozenset = frozenset({
         "i", "a", "the", "is", "it", "do", "we", "my", "me", "an", "in",
@@ -80,13 +81,15 @@ class SymdexConfig:
         "code", "define", "does", "are", "was", "were", "been", "being",
         "have", "has", "had", "having", "can", "could", "should", "would",
     })
+    # Weights: ACT and OBJ dominate (what it does, on what), then DOM, then PAT.
     search_ranking_weights: dict = field(default_factory=lambda: {
         "exact_match": 10.0,
-        "domain_match": 5.0,
-        "action_match": 5.0,
-        "object_match": 3.0,
+        "domain_match": 4.0,
+        "action_match": 6.0,
+        "object_match": 5.0,
         "object_similarity": 2.0,
         "pattern_match": 2.0,
+        "domain_mismatch_penalty": -3.0,
         "tag_match": 1.5,
         "name_match": 3.0,
     })
@@ -226,6 +229,7 @@ class Config:
     
     # Search Configuration
     MAX_SEARCH_RESULTS: int = 5
+    MAX_SEARCH_CANDIDATES: int = 200
     MIN_SEARCH_SCORE: float = float(os.getenv("CYPHER_MIN_SCORE", "5.0"))
     
     # Stop words for query/tag/name matching (centralized to avoid duplication)
@@ -240,13 +244,14 @@ class Config:
     
     SEARCH_RANKING_WEIGHTS: dict = {
         "exact_match": 10.0,
-        "domain_match": 5.0,
-        "action_match": 5.0,
-        "object_match": 3.0,
+        "domain_match": 4.0,
+        "action_match": 6.0,
+        "object_match": 5.0,
         "object_similarity": 2.0,
         "pattern_match": 2.0,
+        "domain_mismatch_penalty": -3.0,
         "tag_match": 1.5,
-        "name_match": 3.0,      # Boosted — function name is a strong relevance signal
+        "name_match": 3.0,
     }
     
     # Logging
@@ -336,6 +341,7 @@ class Config:
             cache_db_name=cls.CACHE_DB_NAME,
             cache_expiry_days=cls.CACHE_EXPIRY_DAYS,
             max_search_results=cls.MAX_SEARCH_RESULTS,
+            max_search_candidates=cls.MAX_SEARCH_CANDIDATES,
             min_search_score=cls.MIN_SEARCH_SCORE,
             stop_words=cls.STOP_WORDS,
             search_ranking_weights=cls.SEARCH_RANKING_WEIGHTS.copy(),
@@ -535,36 +541,42 @@ The user is SEARCHING for code. Your job is to describe WHAT THE TARGET CODE DOE
 
 IMPORTANT: Ignore verbs like "find", "search", "show me", "where is", "look for" — they describe the USER's intent to locate code. Instead, focus on the SUBJECT of the search: what the target code creates, fetches, validates, transforms, etc.
 
-Convert user search queries into Cypher patterns using wildcards (*) for unknown components.
-
 {CypherSchema.format_for_llm()}
 
-RULES:
-1. Use * for unknown components
-2. For OBJ, prefer tokens from COMMON OBJECT CODES that best match the noun in the query (e.g. "dataset" → DATASET, "user" → USER, "request" → REQUEST, "logs" → LOGS).
-3. Output ONLY the Cypher pattern
-4. Be liberal with wildcards - it's better to match too much than too little
-5. Consider synonyms and related terms
-6. When the query mentions "setup", "configure", "initialize" → ACT = CRT
-7. When the query mentions "logging", "log" as the main subject → DOM = LOG, OBJ = LOGS
-8. When unsure about ACT, use * instead of guessing wrong
+Output exactly THREE Cypher patterns, one per line, in order of precision:
+1. TIGHT: No wildcards (or at most one * only where the query is truly ambiguous). Use specific DOM, ACT, OBJ, PAT from the schema.
+2. MEDIUM: One or two wildcards where reasonable (e.g. specific ACT_OBJ but PAT=* or DOM=*).
+3. BROAD: Fallback with wildcards (e.g. *:ACT_*--* or DOM:*_*--*) to catch related code.
 
-EXAMPLES:
-- "find async email functions" → NET:SND_EMAL--ASY
-- "where do we validate users" → SEC:VAL_USER--*
-- "show me data transformations" → DAT:TRN_*--*
-- "where do we fetch the dataset" → DAT:FET_DATASET--*
-- "I search the main logging function for file logs" → LOG:CRT_LOGS--*
-- "security functions" → SEC:*_*--*
-- "find the setup logging function" → LOG:CRT_LOGS--*
-- "where is the config initialized" → SYS:CRT_CONFIG--*
+RULES:
+- For OBJ, use COMMON OBJECT CODES that match the query noun (e.g. "dependencies" → DEPS or DEPENDENCY, "dataset" → DATASET).
+- Prefer specific ACT when the query has a clear verb (e.g. "analyze" → AGG or FLT, "validate" → VAL).
+- When the query mentions "setup", "configure", "initialize" → ACT = CRT.
+- When the query mentions "logging", "log" as main subject → DOM = LOG, OBJ = LOGS.
+- Output ONLY three lines, each line is a single Cypher in format DOM:ACT_OBJ--PAT. No numbering, no explanation.
+
+EXAMPLES (each block is one query → three lines):
+"where do we validate users"
+SEC:VAL_USER--SYN
+SEC:VAL_USER--*
+*:VAL_USER--*
+
+"where does the AI model analyze for dependencies"
+BIZ:AGG_DEPS--SYN
+BIZ:AGG_DEPS--*
+*:AGG_*--*
+
+"find async email functions"
+NET:SND_EMAL--ASY
+NET:SND_EMAL--*
+*:SND_*--ASY
 """
     
-    QUERY_TRANSLATION_USER = """The user wants to FIND code. Describe what the TARGET CODE does as a Cypher pattern.
+    QUERY_TRANSLATION_USER = """The user wants to FIND code. Output exactly THREE Cypher patterns (tight, medium, broad), one per line.
 
 User's search query: "{query}"
 
-Output only the Cypher pattern in format DOM:ACT_OBJ--PAT (use * for wildcards)"""
+Output only three Cypher strings, one per line, in format DOM:ACT_OBJ--PAT. Line 1 = tight (no/minimal wildcards), Line 2 = medium, Line 3 = broad."""
 
 
 # NOTE: Import-time validation removed (v1.1).  Callers that need
