@@ -15,6 +15,7 @@ app = "symdex"
 
 [env]
   MCP_TRANSPORT = "streamable-http"
+  PORT = "8080"
 
 [http_service]
   internal_port = 8080

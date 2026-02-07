@@ -375,10 +375,19 @@ def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: An
             logger.debug("CORSMiddleware not available, skipping CORS")
 
     def patched_uvicorn_run(app_obj: Any, *args: Any, **uvicorn_kwargs: Any) -> None:
-        """Patch uvicorn.run: add server-card route and CORS for Smithery/remote gateways."""
+        """Patch uvicorn.run: add server-card route, CORS, and respect PORT env (Fly.io/Railway)."""
+        import os
         logger.debug(f"uvicorn.run called - app type: {type(app_obj)}")
         add_server_card_route(app_obj)
         add_cors_for_mcp(app_obj)
+        # Fly.io/Railway set PORT; FastMCP may ignore run(port=...), so force it here
+        env_port = os.environ.get("PORT")
+        if env_port:
+            try:
+                uvicorn_kwargs["port"] = int(env_port)
+                logger.info("Using port %s from PORT env", env_port)
+            except ValueError:
+                pass
         return original_uvicorn_run(app_obj, *args, **uvicorn_kwargs)
 
     # Also patch uvicorn.Server.__init__ in case FastMCP uses Server directly
@@ -403,9 +412,13 @@ def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: An
     # Apply uvicorn.run patch
     uvicorn.run = patched_uvicorn_run
     try:
+        import os
         # For Docker/Smithery, bind to 0.0.0.0 so it's accessible from outside container
         host = kwargs.pop("host", "0.0.0.0")
-        port = kwargs.pop("port", 8000)
+        # Port: from kwargs (CLI passes from PORT env), else PORT env, else 8000
+        port = kwargs.pop("port", None)
+        if port is None:
+            port = int(os.environ.get("PORT", "8000"))
         mcp_server.run(transport=transport, host=host, port=port, **kwargs)
     finally:
         # Restore original

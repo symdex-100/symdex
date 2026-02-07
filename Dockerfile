@@ -17,8 +17,9 @@ ARG EXTRAS=anthropic,mcp
 RUN pip install --no-cache-dir ".[${EXTRAS}]"
 
 # Default: run MCP server with HTTP (Streamable HTTP for Smithery / remote clients).
+# App listens on PORT (default 8000; Fly/Railway set PORT=8080). EXPOSE matches typical PORT.
 # Override for CLI: docker run ... symdex --help   or   symdex index /data
 # For stdio (local Cursor): docker run -it ... symdex mcp --transport stdio
-EXPOSE 8000
+EXPOSE 8080
 ENV MCP_TRANSPORT=streamable-http
 CMD ["sh", "-c", "symdex mcp --transport ${MCP_TRANSPORT}"]
