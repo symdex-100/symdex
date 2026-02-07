@@ -391,15 +391,15 @@ except ConfigError:
 ┌─────────────────────────────────────────────────────────────────┐
 │                     SYMDEX-100 ARCHITECTURE                     │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│   Python Source (.py)                                            │
-│         │                                                         │
+│                                                                 │
+│   Python Source (.py)                                           │
+│         │                                                       │
 │         ├─→ [AST Parser] ──→ Function Metadata                  │
-│         │                     (name, args, docstring, ...)       │
-│         │                                                         │
+│         │                     (name, args, docstring, ...)      │
+│         │                                                       │
 │         └─→ [LLM] ──────────→ Cypher Generation                 │
-│                                SEC:VAL_TOKEN--ASY                │
-│                                                                   │
+│                                SEC:VAL_TOKEN--ASY               │
+│                                                                 │
 │   ┌─────────────────────────────────────────────────┐           │
 │   │         .symdex/index.db (SQLite)               │           │
 │   ├─────────────────────────────────────────────────┤           │
@@ -407,20 +407,20 @@ except ConfigError:
 │   │  • SHA256 hash for incremental indexing         │           │
 │   │  • 100:1 compression vs full function bodies    │           │
 │   └─────────────────────────────────────────────────┘           │
-│                        ↓                                         │
+│                        ↓                                        │
 │   ┌─────────────────────────────────────────────────┐           │
 │   │           MULTI-LANE SEARCH ENGINE              │           │
 │   ├─────────────────────────────────────────────────┤           │
-│   │  Query → [LLM] → 3 Cypher patterns (tight/med/broad)         │
+│   │  Query → [LLM] → 3 Cypher patterns (tight/med/broad)        │
 │   │     ↓  Try tight first; merge medium/broad if needed        │
 │   │  5 Lanes per pattern:  Exact │ Domain* │ Act* │ Tags │ Name │
 │   │  (Lane 3 skipped when redundant; tag/name capped)           │
 │   │     ↓  Candidate cap (e.g. 200)                             │
-│   │  Score vs tight pattern → Rank → Format                      │
+│   │  Score vs tight pattern → Rank → Format                     │
 │   └─────────────────────────────────────────────────┘           │
-│                        ↓                                         │
+│                        ↓                                        │
 │   Results (100x faster, 50x fewer tokens)                       │
-│                                                                   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -515,13 +515,13 @@ Agent: "Now I know exactly where to look"
 
 ### Indexing Performance
 
-| Codebase Size | Files | Functions | Time (Anthropic) | Time (Local LLM) |
-|--------------|-------|-----------|------------------|------------------|
-| Small | 100 | 500 | 45s | 15s |
-| Medium | 500 | 2,500 | 3.5min | 1min |
-| Large | 1,000 | 5,000 | 7min | 2min |
-| **Real-world (≈300k LOC)** | **≈1,000** | **≈2,800** | **≈15min** | **≈5min** |
-| Very Large | 5,000 | 25,000 | 35min | 10min |
+| Codebase Size | Files | Functions | Time (Anthropic) | 
+|--------------|-------|-----------|------------------|
+| Small | 100 | 500 | 45s |
+| Medium | 500 | 2,500 | 3.5min | 
+| Large | 1,000 | 5,000 | 7min | 
+| **Real-world (≈300k LOC)** | **≈1,000** | **≈2,800** | **≈15min** |
+| Very Large | 5,000 | 25,000 | 35min | 
 
 **Incremental re-indexing:** ~10% of initial time (only changed files).
 
@@ -915,9 +915,9 @@ If you use Symdex-100 in academic work, please cite:
 ```bibtex
 @software{symdex100_2026,
   title = {Symdex-100: Semantic Fingerprints for Code Search},
-  author = {Your Name},
+  author = {Camillo Pachmann},
   year = {2026},
-  url = {https://github.com/yourusername/symdex-100}
+  url = {https://github.com/symdex-100/symdex}
 }
 ```
 
