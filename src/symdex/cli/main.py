@@ -311,8 +311,8 @@ def stats(ctx: click.Context, cache_dir: str | None):
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--transport", type=click.Choice(["stdio", "sse"]),
-              default="stdio", help="MCP transport (default: stdio).")
+@click.option("--transport", type=click.Choice(["stdio", "http", "sse"]),
+              default="stdio", help="MCP transport (default: stdio; use http for Smithery).")
 @click.option("-v", "--verbose", is_flag=True)
 @click.pass_context
 def mcp(ctx: click.Context, transport: str, verbose: bool):

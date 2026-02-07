@@ -9,8 +9,9 @@ templates** for common search workflows.
 
 Start with::
 
-    symdex mcp                     # stdio transport (default for Cursor)
-    symdex mcp --transport sse     # SSE transport for HTTP-based clients
+    symdex mcp                      # stdio transport (default for Cursor)
+    symdex mcp --transport http     # HTTP (Streamable) for Smithery/remote clients
+    symdex mcp --transport sse      # SSE transport (legacy)
 
 Or programmatically::
 
@@ -317,16 +318,16 @@ SERVER_CARD = {
 
 def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: Any) -> None:
     """
-    Run the MCP server, adding server-card route for SSE transport.
+    Run the MCP server, adding server-card route for HTTP/SSE transports.
 
-    For SSE transport, intercepts FastMCP's app creation via uvicorn.run patching
+    For HTTP or SSE transport, intercepts FastMCP's app creation via uvicorn patching
     to add /.well-known/mcp/server-card.json route for Smithery scanning.
     """
-    if transport != "sse":
+    if transport not in ("http", "sse"):
         mcp_server.run(transport=transport, **kwargs)
         return
 
-    # For SSE, patch uvicorn.run to intercept FastMCP's app and add server-card route
+    # For HTTP/SSE, patch uvicorn to intercept app creation and add server-card route
     from starlette.responses import JSONResponse
     from starlette.routing import Route
     import uvicorn
