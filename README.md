@@ -69,14 +69,14 @@ Each Cypher follows a strict four-slot hierarchy designed for both machine filte
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                                                               │
-│             DOM  :  ACT  _  OBJ  --  PAT                     │
-│              │       │      │        │                        │
-│         Domain   Action  Object   Pattern                    │
-│                                                               │
-│   Where does     What      What is    How does               │
-│   this live?   does it do? the target? it run?               │
-│                                                               │
+│                                                             │
+│            DOM   :   ACT   _   OBJ   --   PAT               │
+│              │        │         │           │               │
+│         Domain   Action       Object        Pattern         │
+│                                                             │
+│   Where does     What does    What is       How does        │
+│   this live?     it do?       the target?   it run?         │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
