@@ -391,15 +391,15 @@ except ConfigError:
 ┌─────────────────────────────────────────────────────────────────┐
 │                     SYMDEX-100 ARCHITECTURE                     │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│   Python Source (.py)                                            │
-│         │                                                         │
+│                                                                 │
+│   Python Source (.py)                                           │
+│         │                                                       │
 │         ├─→ [AST Parser] ──→ Function Metadata                  │
-│         │                     (name, args, docstring, ...)       │
-│         │                                                         │
+│         │                     (name, args, docstring, ...)      │
+│         │                                                       │
 │         └─→ [LLM] ──────────→ Cypher Generation                 │
-│                                SEC:VAL_TOKEN--ASY                │
-│                                                                   │
+│                                SEC:VAL_TOKEN--ASY               │
+│                                                                 │
 │   ┌─────────────────────────────────────────────────┐           │
 │   │         .symdex/index.db (SQLite)               │           │
 │   ├─────────────────────────────────────────────────┤           │
@@ -407,20 +407,20 @@ except ConfigError:
 │   │  • SHA256 hash for incremental indexing         │           │
 │   │  • 100:1 compression vs full function bodies    │           │
 │   └─────────────────────────────────────────────────┘           │
-│                        ↓                                         │
+│                        ↓                                        │
 │   ┌─────────────────────────────────────────────────┐           │
 │   │           MULTI-LANE SEARCH ENGINE              │           │
 │   ├─────────────────────────────────────────────────┤           │
-│   │  Query → [LLM] → 3 Cypher patterns (tight/med/broad)         │
+│   │  Query → [LLM] → 3 Cypher patterns (tight/med/broad)        │
 │   │     ↓  Try tight first; merge medium/broad if needed        │
 │   │  5 Lanes per pattern:  Exact │ Domain* │ Act* │ Tags │ Name │
 │   │  (Lane 3 skipped when redundant; tag/name capped)           │
 │   │     ↓  Candidate cap (e.g. 200)                             │
-│   │  Score vs tight pattern → Rank → Format                      │
+│   │  Score vs tight pattern → Rank → Format                     │
 │   └─────────────────────────────────────────────────┘           │
-│                        ↓                                         │
+│                        ↓                                        │
 │   Results (100x faster, 50x fewer tokens)                       │
-│                                                                   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -515,13 +515,13 @@ Agent: "Now I know exactly where to look"
 
 ### Indexing Performance
 
-| Codebase Size | Files | Functions | Time (Anthropic) | Time (Local LLM) |
-|--------------|-------|-----------|------------------|------------------|
-| Small | 100 | 500 | 45s | 15s |
-| Medium | 500 | 2,500 | 3.5min | 1min |
-| Large | 1,000 | 5,000 | 7min | 2min |
-| **Real-world (≈300k LOC)** | **≈1,000** | **≈2,800** | **≈15min** | **≈5min** |
-| Very Large | 5,000 | 25,000 | 35min | 10min |
+| Codebase Size | Files | Functions | Time (Anthropic) | 
+|--------------|-------|-----------|------------------|
+| Small | 100 | 500 | 45s |
+| Medium | 500 | 2,500 | 3.5min | 
+| Large | 1,000 | 5,000 | 7min | 
+| **Real-world (≈300k LOC)** | **≈1,000** | **≈2,800** | **≈15min** |
+| Very Large | 5,000 | 25,000 | 35min | 
 
 **Incremental re-indexing:** ~10% of initial time (only changed files).
 
@@ -616,6 +616,8 @@ export SYMDEX_MAX_CONCURRENT=10
 
 ## Docker Usage
 
+The image includes MCP server support by default (install extras: `anthropic,mcp`). Override with build arg `EXTRAS` (e.g. `openai,mcp` or `llm-all,mcp`) if needed.
+
 ```bash
 # Index a project
 docker run -v /host/project:/data symdex-100 \
@@ -627,6 +629,25 @@ docker run -v /host/project:/data symdex-100 \
 ```
 
 **Note:** `--cache-dir` must be the path *inside* the container.
+
+### Running the MCP server in Docker (e.g. Smithery)
+
+The default container command runs the MCP server with **SSE** transport so remote clients (Smithery gateway, HTTP-based MCP clients) can connect:
+
+```bash
+# Default: symdex mcp --transport sse (listens for remote connections)
+docker run -p 8000:8000 -v /host/project:/data -e ANTHROPIC_API_KEY=sk-... symdex-100
+```
+
+For **stdio** (e.g. local Cursor talking to a container), override the command:
+
+```bash
+docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
+```
+
+With docker-compose, the default service runs `symdex mcp --transport sse`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
+
+**Smithery deployment:** The repo includes `smithery.yaml` (container runtime, optional config schema for API keys) and serves `/.well-known/mcp/server-card.json` from the MCP server for Smithery scanning. No separate CI step is required for Smithery; connect the repo in Smithery and deploy. Optional: use GitHub Actions (`.github/workflows/ci.yml` for tests, `release.yml` for tagged releases).
 
 ---
 
@@ -646,12 +667,14 @@ docker run -v /host/project:/data symdex-100 \
 - ✅ Async API (`aindex`, `asearch`, `astats` via `asyncio.to_thread`)
 - ✅ Custom exception hierarchy (`SymdexError`, `ConfigError`, `IndexNotFoundError`, etc.)
 - ✅ Lazy LLM initialization (search without API key for direct/keyword strategies)
+- ✅ Rule-only mode (`SYMDEX_CYPHER_FALLBACK_ONLY`) — no API key required
 - ✅ `IndexingPipeline.run()` returns typed `IndexResult`
 - ✅ No import-time side effects (safe to `import symdex` as a library)
 - ✅ Thread-local SQLite connections in `CypherCache`
 - ✅ MCP resources (Cypher schema), prompt templates, health endpoint
 - ✅ CLI decoupled from core (instance-based config throughout)
 - ✅ Legacy CLI code removed from core modules
+- ✅ Smithery-ready (server-card, config schema, Docker); GitHub Actions CI/release
 
 ### v1.2 — Enhanced Intelligence
 - 🔄 Local LLM support (Ollama, llama.cpp)
@@ -685,8 +708,11 @@ A: Add `.symdex/` to `.gitignore`. Teammates run `symdex index .` to rebuild (~3
 **Q: How accurate is the LLM Cypher generation?**  
 A: 94% match human classification on validation set of 500 functions. Mismatches are usually domain ambiguity (e.g., `DAT:DEL_USER` vs `BIZ:DEL_USER`), which multi-lane search handles.
 
+**Q: Can I run without an API key?**  
+A: Yes. Set `SYMDEX_CYPHER_FALLBACK_ONLY=1` (or use `SymdexConfig(cypher_fallback_only=True)`). Indexing and search use rule-based Cypher generation only — no LLM calls. Good for CI, air-gapped environments, or trying Symdex before adding a key.
+
 **Q: Can I use a local LLM?**  
-A: Yes (v1.1). Currently supports Anthropic/OpenAI/Gemini. Ollama integration coming soon. You can extend `LLMProvider` in `engine.py` today.
+A: Yes (v1.1). Currently supports Anthropic/OpenAI/Gemini. Ollama integration is planned for v1.2; you can extend `LLMProvider` in `engine.py` today.
 
 **Q: What's the indexing cost?**  
 A: ~$0.003/function (Anthropic Haiku). 10K functions = ~$30 initial index. Incremental updates ~$1-3/month.
@@ -705,6 +731,9 @@ A: No. Install from source with `pip install -e ".[all]"` and it's importable im
 
 **Q: Does the API support async?**  
 A: Yes. All operations have async variants (`aindex`, `asearch`, `astats`) that use `asyncio.to_thread()`. This works with FastAPI, Django async views, and any asyncio-based framework. Native async LLM providers are planned for v2.0.
+
+**Q: How do I deploy the MCP server (e.g. Smithery)?**  
+A: Use the included Docker image and `smithery.yaml`. The server advertises `/.well-known/mcp/server-card.json` for scanning. Connect the repo in Smithery and deploy; optionally set API keys in Smithery's config or use rule-only mode with no keys.
 
 ---
 
@@ -801,6 +830,27 @@ for h in hits:
 hits = client.search_by_cypher("*:VAL_*--*", path=".")
 ```
 
+### 3b. Manually test the API with an example repository
+
+To index a directory and run example searches in one go (index → stats → natural-language search → Cypher pattern search):
+
+```bash
+# Index and search this repo's src/ (default)
+python scripts/try_api.py
+
+# Use a specific folder
+python scripts/try_api.py src
+python scripts/try_api.py /path/to/any/python/project
+
+# Index only (then use REPL or your own script to search)
+python scripts/try_api.py src --index-only
+
+# No API key: use rule-based Cypher fallback only
+python scripts/try_api.py src --no-llm
+```
+
+The script prints index results, stats, and sample search hits so you can review the API behaviour end-to-end.
+
 ### 4. Use from another local project
 
 If you have a **separate** project that wants to use Symdex as a dependency:
@@ -865,9 +915,9 @@ If you use Symdex-100 in academic work, please cite:
 ```bibtex
 @software{symdex100_2026,
   title = {Symdex-100: Semantic Fingerprints for Code Search},
-  author = {Your Name},
+  author = {Camillo Pachmann},
   year = {2026},
-  url = {https://github.com/yourusername/symdex-100}
+  url = {https://github.com/symdex-100/symdex}
 }
 ```
 

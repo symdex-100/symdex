@@ -95,7 +95,12 @@ class CypherMeta:
 
 @dataclass
 class SearchResult:
-    """Search result with ranking."""
+    """Search result with ranking.
+
+    :attr:`file_path` is stored as resolved during indexing (typically absolute).
+    When :attr:`path_root` is set, integrators can relativize with
+    ``os.path.relpath(file_path, path_root)`` for display or API responses.
+    """
     file_path: str
     function_name: str
     line_start: int
@@ -103,9 +108,15 @@ class SearchResult:
     cypher: str
     score: float
     context: str = ""
-    
+    path_root: str = ""
+    """Index root directory (e.g. project path). Empty if not provided."""
+
     def __lt__(self, other):
         return self.score > other.score  # Higher score = better
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serializable dict for API/agent pipelines."""
+        return asdict(self)
 
 
 @dataclass
@@ -124,6 +135,10 @@ class IndexResult:
     errors: int = 0
     root_dir: str = ""
     index_dir: str = ""
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serializable dict for API/agent pipelines."""
+        return asdict(self)
 
 
 # =============================================================================
@@ -281,6 +296,12 @@ class CypherCache:
             self._local.conn = sqlite3.connect(self.db_path)
         return self._local.conn
 
+    def close(self) -> None:
+        """Close the thread-local connection for the current thread. Idempotent."""
+        if hasattr(self._local, "conn") and self._local.conn is not None:
+            self._local.conn.close()
+            self._local.conn = None
+
     def _init_db(self):
         """Initialize the database schema."""
         conn = self._get_connection()
@@ -334,10 +355,12 @@ class CypherCache:
         """Mark a file as indexed."""
         file_hash = self.get_file_hash(file_path)
         conn = self._get_connection()
+        # Use ISO string to avoid sqlite3 default datetime adapter deprecation (Python 3.12+)
+        now_iso = datetime.now().isoformat()
         conn.execute("""
             INSERT OR REPLACE INTO indexed_files (file_path, file_hash, last_indexed, function_count)
             VALUES (?, ?, ?, ?)
-        """, (str(file_path), file_hash, datetime.now(), function_count))
+        """, (str(file_path), file_hash, now_iso, function_count))
         conn.commit()
 
     def add_cypher_entry(self, file_path: Path, function_name: str, line_start: int,
@@ -345,12 +368,13 @@ class CypherCache:
                          signature: str, complexity: str):
         """Add a Cypher entry to the index."""
         conn = self._get_connection()
+        now_iso = datetime.now().isoformat()
         conn.execute("""
             INSERT INTO cypher_index
             (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(file_path), function_name, line_start, line_end, cypher,
-              ",".join(tags), signature, complexity, datetime.now()))
+              ",".join(tags), signature, complexity, now_iso))
         conn.commit()
 
     def search_by_cypher(self, pattern: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -647,10 +671,16 @@ class CypherGenerator:
         Retries on both API errors AND invalid LLM responses (up to
         ``retry_attempts`` total).  Only falls back to the rule-based
         generator after all attempts are exhausted.
+
+        When config ``cypher_fallback_only`` is True, skips the LLM
+        entirely and returns the rule-based Cypher immediately.
         """
         import time
 
         cfg = self._effective_config
+        if getattr(cfg, "cypher_fallback_only", False):
+            return self._generate_fallback_cypher(metadata)
+
         for attempt in range(1, cfg.retry_attempts + 1):
             try:
                 cypher = self._ensure_llm().complete(
@@ -717,10 +747,16 @@ class CypherGenerator:
 
         Returns a list of 1 or 3 patterns. Callers should try the first (tight) pattern,
         then optionally the next if result count is low, then the third.
+
+        When config ``cypher_fallback_only`` is True, skips the LLM
+        and returns a single keyword-based pattern.
         """
         import time
 
         cfg = self._effective_config
+        if getattr(cfg, "cypher_fallback_only", False):
+            return [CypherGenerator._keyword_based_translation(natural_query)]
+
         for attempt in range(1, cfg.retry_attempts + 1):
             try:
                 raw = self._ensure_llm().complete(

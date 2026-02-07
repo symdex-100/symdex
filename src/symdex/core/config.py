@@ -69,6 +69,10 @@ class SymdexConfig:
     cache_db_name: str = "index.db"
     cache_expiry_days: int = 30
 
+    # ── Cypher generation (skip LLM) ──────────────────────────────
+    cypher_fallback_only: bool = False
+    """If True, never call the LLM; use rule-based Cypher and query translation only."""
+
     # ── Search ────────────────────────────────────────────────────
     max_search_results: int = 5
     max_search_candidates: int = 200  # Cap merged candidates before scoring (0 = no cap)
@@ -102,7 +106,13 @@ class SymdexConfig:
 
     @classmethod
     def from_env(cls) -> "SymdexConfig":
-        """Build a config snapshot from current environment variables."""
+        """Build a config snapshot from current environment variables.
+
+        Reads :envvar:`SYMDEX_CYPHER_FALLBACK_ONLY` (1/true/yes) to enable
+        rule-only mode without an LLM API key.
+        """
+        fallback_raw = os.getenv("SYMDEX_CYPHER_FALLBACK_ONLY", "").lower()
+        cypher_fallback_only = fallback_raw in ("1", "true", "yes", "on")
         return cls(
             llm_provider=os.getenv("SYMDEX_LLM_PROVIDER", "anthropic").lower(),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -114,6 +124,7 @@ class SymdexConfig:
             llm_max_tokens=int(os.getenv("SYMDEX_MAX_TOKENS", "300")),
             min_search_score=float(os.getenv("CYPHER_MIN_SCORE", "5.0")),
             log_level=os.getenv("CYPHER_LOG_LEVEL", "INFO"),
+            cypher_fallback_only=cypher_fallback_only,
         )
 
     # ── Validation & Accessors ────────────────────────────────────
@@ -122,9 +133,13 @@ class SymdexConfig:
         """
         Validate that the active LLM provider has an API key set.
 
+        When :attr:`cypher_fallback_only` is True, skips key check (no LLM used).
         Raises :class:`~symdex.exceptions.ConfigError` on failure.
         """
         from symdex.exceptions import ConfigError
+
+        if getattr(self, "cypher_fallback_only", False):
+            return True
 
         key_map = {
             "anthropic": ("ANTHROPIC_API_KEY", self.anthropic_api_key),

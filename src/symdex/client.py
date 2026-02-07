@@ -58,6 +58,11 @@ class Symdex:
     Args:
         config: Explicit configuration object.  When *None*, a config
             is built from environment variables or keyword overrides.
+        validate_on_init: If True, call :meth:`SymdexConfig.validate` in
+            __init__ so missing API keys or invalid config surface immediately
+            instead of on first :meth:`index` or :meth:`search`. Omit or False
+            for embedding when using :attr:`cypher_fallback_only` or when
+            validation is done separately.
         **kwargs: Forwarded to :class:`SymdexConfig` when *config* is
             ``None`` (e.g. ``llm_provider="openai"``).
     """
@@ -65,6 +70,8 @@ class Symdex:
     def __init__(
         self,
         config: SymdexConfig | None = None,
+        *,
+        validate_on_init: bool = False,
         **kwargs,
     ):
         if config is not None:
@@ -79,6 +86,9 @@ class Symdex:
             self._config = SymdexConfig(**merged)
         else:
             self._config = SymdexConfig.from_env()
+
+        if validate_on_init:
+            self._config.validate()
 
         # Cache search engines per index path to avoid re-creating them
         self._engines: Dict[Path, object] = {}
@@ -149,7 +159,9 @@ class Symdex:
             min_score: Minimum relevance score threshold.
 
         Returns:
-            Ranked list of :class:`SearchResult` objects.
+            Ranked list of :class:`SearchResult` objects. Each result has
+            :attr:`~SearchResult.path_root` set when available for
+            relativizing :attr:`~SearchResult.file_path` (see ARCHITECTURE).
 
         Raises:
             IndexNotFoundError: If no index exists at *path*.
@@ -184,7 +196,11 @@ class Symdex:
             max_results: Maximum hits to return.
 
         Returns:
-            Ranked list of :class:`SearchResult` objects.
+            Ranked list of :class:`SearchResult` objects (each has
+            :attr:`~SearchResult.path_root` set when available).
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
         """
         cache_dir = Path(path).resolve() / self._config.symdex_dir
         db = self._config.get_cache_path(cache_dir)
@@ -217,11 +233,15 @@ class Symdex:
             raise IndexNotFoundError(f"No Symdex index found at {db}.")
 
         cache = CypherCache(db)
-        return cache.get_stats()
+        try:
+            return cache.get_stats()
+        finally:
+            cache.close()
 
     # ── Async variants ────────────────────────────────────────────
     # These use asyncio.to_thread() to run sync operations off the
-    # event loop.  Native async LLM clients are a future enhancement.
+    # event loop. They raise the same exceptions as the sync methods
+    # (e.g. IndexNotFoundError, ConfigError).
 
     async def aindex(
         self,
@@ -230,7 +250,7 @@ class Symdex:
         force: bool = False,
         dry_run: bool = False,
     ) -> IndexResult:
-        """Async variant of :meth:`index`."""
+        """Async variant of :meth:`index`. Raises same exceptions as sync."""
         return await asyncio.to_thread(
             self.index, directory, force=force, dry_run=dry_run,
         )
@@ -244,16 +264,46 @@ class Symdex:
         max_results: int | None = None,
         min_score: float | None = None,
     ) -> List[SearchResult]:
-        """Async variant of :meth:`search`."""
+        """Async variant of :meth:`search`. Raises same exceptions as sync."""
         return await asyncio.to_thread(
             self.search, query,
             path=path, strategy=strategy,
             max_results=max_results, min_score=min_score,
         )
 
+    async def asearch_by_cypher(
+        self,
+        pattern: str,
+        *,
+        path: str | Path = ".",
+        max_results: int = 10,
+    ) -> List[SearchResult]:
+        """Async variant of :meth:`search_by_cypher`. Raises same exceptions as sync."""
+        return await asyncio.to_thread(
+            self.search_by_cypher, pattern,
+            path=path, max_results=max_results,
+        )
+
     async def astats(self, path: str | Path = ".") -> Dict[str, int]:
-        """Async variant of :meth:`stats`."""
+        """Async variant of :meth:`stats`. Raises same exceptions as sync."""
         return await asyncio.to_thread(self.stats, path)
+
+    # ── Health (for agents / status endpoints) ─────────────────────
+
+    def health(self) -> Dict[str, object]:
+        """
+        Return a small status dict for agents or REST health checks.
+
+        Does not require an index or network. Use for readiness probes
+        or reporting which provider/version is active.
+        """
+        return {
+            "version": __import__("symdex", fromlist=["__version__"]).__version__,
+            "llm_provider": self._config.llm_provider,
+            "cypher_fallback_only": getattr(
+                self._config, "cypher_fallback_only", False
+            ),
+        }
 
     # ── Internal helpers ──────────────────────────────────────────
 

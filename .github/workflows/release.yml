@@ -1,0 +1,40 @@
+# Release: on version tag push, run tests and create a GitHub release.
+# Tag format: v* (e.g. v1.0.0). Smithery can deploy from repo or from release assets.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" && pytest tests/ -v --tb=short
+        env:
+          ANTHROPIC_API_KEY: "test-key"
+          OPENAI_API_KEY: "test-key"
+          GEMINI_API_KEY: "test-key"
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

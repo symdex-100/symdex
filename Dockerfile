@@ -11,9 +11,14 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 
-# Install the package with the default (Anthropic) provider
-# Switch to [openai] or [gemini] or [llm-all] as needed.
-RUN pip install --no-cache-dir ".[anthropic]"
+# Install the package with LLM provider + MCP server support.
+# Build arg: EXTRAS e.g. "anthropic,mcp" or "openai,mcp" or "llm-all,mcp"
+ARG EXTRAS=anthropic,mcp
+RUN pip install --no-cache-dir ".[${EXTRAS}]"
 
-# Default: show CLI help (overridden by docker-compose)
-CMD ["symdex", "--help"]
+# Default: run MCP server with SSE (for Smithery / remote clients). FastMCP SSE uses port 8000.
+# Override for CLI: docker run ... symdex --help   or   symdex index /data
+# For stdio (local Cursor): docker run -it ... symdex mcp --transport stdio
+EXPOSE 8000
+ENV MCP_TRANSPORT=sse
+CMD ["sh", "-c", "symdex mcp --transport ${MCP_TRANSPORT}"]

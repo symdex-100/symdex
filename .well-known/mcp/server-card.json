@@ -1,0 +1,74 @@
+{
+  "serverInfo": {
+    "name": "Symdex-100",
+    "version": "1.0.0"
+  },
+  "authentication": {
+    "required": false,
+    "schemes": []
+  },
+  "tools": [
+    {
+      "name": "search_codebase",
+      "description": "Search the Symdex index for functions matching a natural-language query or Cypher pattern.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" },
+          "path": { "type": "string", "default": "." },
+          "strategy": { "type": "string", "default": "auto" },
+          "max_results": { "type": "integer", "default": 10 }
+        }
+      }
+    },
+    {
+      "name": "search_by_cypher",
+      "description": "Find code segments matching a Cypher-100 pattern directly (no LLM).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cypher_pattern": { "type": "string" },
+          "path": { "type": "string", "default": "." },
+          "max_results": { "type": "integer", "default": 10 }
+        }
+      }
+    },
+    {
+      "name": "index_directory",
+      "description": "Index all supported source files in a directory and build a sidecar search index in .symdex/",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "default": "." },
+          "force": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    {
+      "name": "get_index_stats",
+      "description": "Return statistics about the Symdex index for a directory.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "default": "." }
+        }
+      }
+    },
+    {
+      "name": "health",
+      "description": "Check that the Symdex MCP server is running and responsive.",
+      "inputSchema": { "type": "object", "properties": {} }
+    }
+  ],
+  "resources": [
+    { "uri": "symdex://schema/domains", "description": "Cypher domain codes and descriptions" },
+    { "uri": "symdex://schema/actions", "description": "Cypher action codes and descriptions" },
+    { "uri": "symdex://schema/patterns", "description": "Cypher pattern codes and descriptions" },
+    { "uri": "symdex://schema/full", "description": "Complete Cypher-100 schema" }
+  ],
+  "prompts": [
+    { "name": "find_security_functions", "description": "Find all security-related functions" },
+    { "name": "audit_domain", "description": "Audit all functions in a specific domain" },
+    { "name": "explore_codebase", "description": "High-level architecture overview via domain stats" }
+  ]
+}

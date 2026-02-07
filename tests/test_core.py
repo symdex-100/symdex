@@ -162,7 +162,9 @@ class TestCypherCache:
 
     @pytest.fixture
     def cache(self, tmp_path) -> CypherCache:
-        return CypherCache(tmp_path / "test_cache.db")
+        c = CypherCache(tmp_path / "test_cache.db")
+        yield c
+        c.close()  # avoid ResourceWarning: unclosed database
 
     @pytest.fixture
     def sample_file(self, tmp_path) -> Path:
