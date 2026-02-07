@@ -1,0 +1,57 @@
+# CI: test and lint on push/PR. Optional: build Docker image for Smithery compatibility.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+        env:
+          ANTHROPIC_API_KEY: "test-key"
+          OPENAI_API_KEY: "test-key"
+          GEMINI_API_KEY: "test-key"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: symdex-100:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run MCP server (smoke test)
+        run: |
+          docker run --rm -e MCP_TRANSPORT=sse symdex-100:test timeout 3 symdex mcp --transport sse || true

@@ -224,7 +224,7 @@ def create_server(config: SymdexConfig | None = None):
         """
         return json.dumps({
             "status": "ok",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "provider": cfg.llm_provider,
             "model": cfg.get_model(),
         })
@@ -293,5 +293,36 @@ def create_server(config: SymdexConfig | None = None):
             "which domains are most populated, key functions in each, and any "
             "gaps or areas that might need attention."
         )
+
+    # Serve /.well-known/mcp/server-card.json for Smithery server scanning
+    # (https://smithery.ai/docs/build/external#server-scanning)
+    _SERVER_CARD = {
+        "serverInfo": {"name": "Symdex-100", "version": "1.1.0"},
+        "authentication": {"required": False, "schemes": []},
+        "tools": [
+            {"name": "search_codebase", "description": "Search the Symdex index by natural-language or Cypher pattern.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
+            {"name": "search_by_cypher", "description": "Find code matching a Cypher-100 pattern (no LLM).", "inputSchema": {"type": "object", "properties": {"cypher_pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}}},
+            {"name": "index_directory", "description": "Index source files into .symdex/ sidecar.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}}}},
+            {"name": "get_index_stats", "description": "Return index statistics for a directory.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+            {"name": "health", "description": "Server readiness check.", "inputSchema": {"type": "object", "properties": {}}},
+        ],
+        "resources": [
+            {"uri": "symdex://schema/domains", "description": "Cypher domain codes"},
+            {"uri": "symdex://schema/actions", "description": "Cypher action codes"},
+            {"uri": "symdex://schema/patterns", "description": "Cypher pattern codes"},
+            {"uri": "symdex://schema/full", "description": "Complete Cypher-100 schema"},
+        ],
+        "prompts": [
+            {"name": "find_security_functions", "description": "Find all security-related functions"},
+            {"name": "audit_domain", "description": "Audit all functions in a domain"},
+            {"name": "explore_codebase", "description": "High-level codebase overview"},
+        ],
+    }
+    if hasattr(mcp, "custom_route"):
+        # FastMCP custom_route for Smithery scanning
+        async def _serve_server_card(request: Any) -> Any:
+            from starlette.responses import JSONResponse
+            return JSONResponse(_SERVER_CARD)
+        mcp.custom_route("/.well-known/mcp/server-card.json", methods=["GET"])(_serve_server_card)
 
     return mcp

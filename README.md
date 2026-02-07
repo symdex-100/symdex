@@ -647,6 +647,8 @@ docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
 
 With docker-compose, the default service runs `symdex mcp --transport sse`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
 
+**Smithery deployment:** The repo includes `smithery.yaml` (container runtime, optional config schema for API keys) and serves `/.well-known/mcp/server-card.json` from the MCP server for Smithery scanning. No separate CI step is required for Smithery; connect the repo in Smithery and deploy. Optional: use GitHub Actions (`.github/workflows/ci.yml` for tests, `release.yml` for tagged releases).
+
 ---
 
 ## Roadmap
@@ -665,12 +667,14 @@ With docker-compose, the default service runs `symdex mcp --transport sse`. Set 
 - ✅ Async API (`aindex`, `asearch`, `astats` via `asyncio.to_thread`)
 - ✅ Custom exception hierarchy (`SymdexError`, `ConfigError`, `IndexNotFoundError`, etc.)
 - ✅ Lazy LLM initialization (search without API key for direct/keyword strategies)
+- ✅ Rule-only mode (`SYMDEX_CYPHER_FALLBACK_ONLY`) — no API key required
 - ✅ `IndexingPipeline.run()` returns typed `IndexResult`
 - ✅ No import-time side effects (safe to `import symdex` as a library)
 - ✅ Thread-local SQLite connections in `CypherCache`
 - ✅ MCP resources (Cypher schema), prompt templates, health endpoint
 - ✅ CLI decoupled from core (instance-based config throughout)
 - ✅ Legacy CLI code removed from core modules
+- ✅ Smithery-ready (server-card, config schema, Docker); GitHub Actions CI/release
 
 ### v1.2 — Enhanced Intelligence
 - 🔄 Local LLM support (Ollama, llama.cpp)
@@ -704,8 +708,11 @@ A: Add `.symdex/` to `.gitignore`. Teammates run `symdex index .` to rebuild (~3
 **Q: How accurate is the LLM Cypher generation?**  
 A: 94% match human classification on validation set of 500 functions. Mismatches are usually domain ambiguity (e.g., `DAT:DEL_USER` vs `BIZ:DEL_USER`), which multi-lane search handles.
 
+**Q: Can I run without an API key?**  
+A: Yes. Set `SYMDEX_CYPHER_FALLBACK_ONLY=1` (or use `SymdexConfig(cypher_fallback_only=True)`). Indexing and search use rule-based Cypher generation only — no LLM calls. Good for CI, air-gapped environments, or trying Symdex before adding a key.
+
 **Q: Can I use a local LLM?**  
-A: Yes (v1.1). Currently supports Anthropic/OpenAI/Gemini. Ollama integration coming soon. You can extend `LLMProvider` in `engine.py` today.
+A: Yes (v1.1). Currently supports Anthropic/OpenAI/Gemini. Ollama integration is planned for v1.2; you can extend `LLMProvider` in `engine.py` today.
 
 **Q: What's the indexing cost?**  
 A: ~$0.003/function (Anthropic Haiku). 10K functions = ~$30 initial index. Incremental updates ~$1-3/month.
@@ -724,6 +731,9 @@ A: No. Install from source with `pip install -e ".[all]"` and it's importable im
 
 **Q: Does the API support async?**  
 A: Yes. All operations have async variants (`aindex`, `asearch`, `astats`) that use `asyncio.to_thread()`. This works with FastAPI, Django async views, and any asyncio-based framework. Native async LLM providers are planned for v2.0.
+
+**Q: How do I deploy the MCP server (e.g. Smithery)?**  
+A: Use the included Docker image and `smithery.yaml`. The server advertises `/.well-known/mcp/server-card.json` for scanning. Connect the repo in Smithery and deploy; optionally set API keys in Smithery's config or use rule-only mode with no keys.
 
 ---
 

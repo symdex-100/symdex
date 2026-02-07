@@ -1,0 +1,36 @@
+# Smithery project configuration for MCP server deployment.
+# See https://smithery.ai/docs/build/project-config/smithery-yaml
+
+runtime: "container"
+
+startCommand:
+  type: "http"
+  configSchema:
+    type: "object"
+    properties:
+      ANTHROPIC_API_KEY:
+        type: "string"
+        title: "Anthropic API Key"
+        description: "Optional. For LLM-based Cypher generation; omit to use rule-based fallback only."
+      OPENAI_API_KEY:
+        type: "string"
+        title: "OpenAI API Key"
+        description: "Optional. Alternative to Anthropic for Cypher generation."
+      SYMDEX_LLM_PROVIDER:
+        type: "string"
+        title: "LLM Provider"
+        description: "One of anthropic, openai, gemini."
+        default: "anthropic"
+      SYMDEX_CYPHER_FALLBACK_ONLY:
+        type: "string"
+        title: "Rule-only mode"
+        description: "Set to 1 or true to disable LLM (no API key needed)."
+        default: "0"
+    required: []
+
+build:
+  dockerfile: "Dockerfile"
+  dockerBuildPath: "."
+
+env:
+  NODE_ENV: "production"
