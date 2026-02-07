@@ -329,8 +329,10 @@ def mcp(ctx: click.Context, transport: str, verbose: bool):
         )
         raise SystemExit(1)
 
+    from symdex.mcp.server import create_server, run_with_server_card
+
     server = create_server(config=cfg)
-    server.run(transport=transport)
+    run_with_server_card(server, transport=transport)
 
 
 # ---------------------------------------------------------------------------
