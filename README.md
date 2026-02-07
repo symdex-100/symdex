@@ -647,7 +647,7 @@ docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
 
 With docker-compose, the default service runs `symdex mcp --transport streamable-http`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
 
-**Smithery deployment:** Smithery **builds and runs this repo as a container** from the GitHub URL — you do not need a separate server. The repo includes `smithery.yaml` (container runtime, config schema with `x-from` for API key headers). The MCP server uses **Streamable HTTP** on **`/mcp`**, serves **`/.well-known/mcp/server-card.json`** for metadata, and sets **CORS** so the gateway can read `Mcp-Session-Id` and complete initialization. To publish: connect the repo at [smithery.ai/new](https://smithery.ai/new). Optional: use GitHub Actions (`.github/workflows/ci.yml`, `release.yml`) for tests and releases.
+**Publishing on Smithery:** Smithery *can* host from GitHub, but **Hosted** deploy is for servers built with the [Smithery CLI and SDK](https://smithery.ai/docs/build/build) (TypeScript) and runs in their edge runtime—**128 MB, no filesystem, no native modules, no spawning processes** ([Hosting Limits](https://smithery.ai/docs/build/limits)). Symdex needs filesystem (SQLite index, reading source files) and a Python runtime, so it cannot run in that environment. Use the **URL** method: host the server elsewhere and give Smithery your public HTTPS URL. The server uses **Streamable HTTP** on **`/mcp`**, serves **`/.well-known/mcp/server-card.json`**, and sends CORS headers. To get a URL with no server to maintain: deploy this repo’s Docker image to [Fly.io](https://fly.io) or [Railway](https://railway.app). With Fly: install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly launch` in this repo, then `fly deploy`; at [smithery.ai/new](https://smithery.ai/new) choose **URL** and enter `https://<app-name>.fly.dev/mcp`. The repo includes `fly.toml` for Fly.
 
 ---
 
@@ -732,8 +732,8 @@ A: No. Install from source with `pip install -e ".[all]"` and it's importable im
 **Q: Does the API support async?**  
 A: Yes. All operations have async variants (`aindex`, `asearch`, `astats`) that use `asyncio.to_thread()`. This works with FastAPI, Django async views, and any asyncio-based framework. Native async LLM providers are planned for v2.0.
 
-**Q: How do I deploy the MCP server (e.g. Smithery)?**  
-A: Use the included Docker image and `smithery.yaml`. The server advertises `/.well-known/mcp/server-card.json` for scanning. Connect the repo in Smithery and deploy; optionally set API keys in Smithery's config or use rule-only mode with no keys.
+**Q: How do I deploy the MCP server on Smithery?**  
+A: Smithery **Hosted** (GitHub → they build and run) only runs servers built with their TypeScript CLI/SDK in their edge runtime (no filesystem, 128 MB). Symdex is Python and needs filesystem (SQLite, source files), so use the **URL** method: deploy this repo’s Docker image to Fly.io or Railway, then at [smithery.ai/new](https://smithery.ai/new) choose **URL** and enter `https://your-app.example.com/mcp`. The server exposes `/.well-known/mcp/server-card.json` and Streamable HTTP on `/mcp`.
 
 ---
 
