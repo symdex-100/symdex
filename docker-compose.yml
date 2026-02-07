@@ -8,7 +8,7 @@ services:
       # CODE_DIR should point to the project you want to index.
       - "${CODE_DIR:-.}:/data"
 
-    # Default: run MCP server (SSE) for Smithery / remote clients.
+    # Default: run MCP server (HTTP/Streamable) for Smithery / remote clients.
     # For CLI only: command: ["symdex", "--help"]
     # For stdio (local Cursor): command: ["symdex", "mcp", "--transport", "stdio"]
-    command: ["symdex", "mcp", "--transport", "sse"]
+    command: ["symdex", "mcp", "--transport", "http"]

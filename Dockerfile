@@ -16,9 +16,9 @@ COPY src/ ./src/
 ARG EXTRAS=anthropic,mcp
 RUN pip install --no-cache-dir ".[${EXTRAS}]"
 
-# Default: run MCP server with SSE (for Smithery / remote clients). FastMCP SSE uses port 8000.
+# Default: run MCP server with HTTP (Streamable HTTP for Smithery / remote clients).
 # Override for CLI: docker run ... symdex --help   or   symdex index /data
 # For stdio (local Cursor): docker run -it ... symdex mcp --transport stdio
 EXPOSE 8000
-ENV MCP_TRANSPORT=sse
+ENV MCP_TRANSPORT=http
 CMD ["sh", "-c", "symdex mcp --transport ${MCP_TRANSPORT}"]
