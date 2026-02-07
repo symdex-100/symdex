@@ -335,14 +335,13 @@ def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: An
         """Serve the server-card JSON for Smithery scanning."""
         return JSONResponse(SERVER_CARD)
 
-    # Patch uvicorn.run to add server-card route to any Starlette/FastAPI app
+    # Patch uvicorn to intercept app creation and add server-card route
+    # FastMCP may use uvicorn.run() or uvicorn.Server() directly
     original_uvicorn_run = uvicorn.run
-
-    def patched_uvicorn_run(app_obj: Any, *args: Any, **uvicorn_kwargs: Any) -> None:
-        """Patch uvicorn.run to add server-card route before running."""
-        # Check if app has routes (Starlette/FastAPI)
+    
+    def add_server_card_route(app_obj: Any) -> None:
+        """Helper to add server-card route to a Starlette/FastAPI app."""
         if hasattr(app_obj, "routes") and isinstance(app_obj.routes, list):
-            # Check if route already exists
             route_exists = any(
                 hasattr(route, "path") and route.path == "/.well-known/mcp/server-card.json"
                 for route in app_obj.routes
@@ -352,12 +351,46 @@ def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: An
                     Route("/.well-known/mcp/server-card.json", serve_server_card, methods=["GET"])
                 )
                 logger.info("Added server-card route: /.well-known/mcp/server-card.json")
+                return True
+        return False
+
+    def patched_uvicorn_run(app_obj: Any, *args: Any, **uvicorn_kwargs: Any) -> None:
+        """Patch uvicorn.run to add server-card route before running."""
+        logger.debug(f"uvicorn.run called - app type: {type(app_obj)}")
+        add_server_card_route(app_obj)
         return original_uvicorn_run(app_obj, *args, **uvicorn_kwargs)
 
-    # Apply patch
+    # Also patch uvicorn.Server.__init__ in case FastMCP uses Server directly
+    try:
+        import uvicorn.server
+        original_server_init = uvicorn.server.Server.__init__
+        
+        def patched_server_init(self: Any, config: Any, *args: Any, **kwargs: Any) -> None:
+            """Patch Server.__init__ to add server-card route."""
+            original_server_init(self, config, *args, **kwargs)
+            if hasattr(config, "app"):
+                logger.debug(f"uvicorn.Server.__init__ - app type: {type(config.app)}")
+                add_server_card_route(config.app)
+        
+        uvicorn.server.Server.__init__ = patched_server_init
+        server_patched = True
+    except (AttributeError, ImportError):
+        server_patched = False
+        logger.debug("Could not patch uvicorn.Server.__init__")
+
+    # Apply uvicorn.run patch
     uvicorn.run = patched_uvicorn_run
     try:
-        mcp_server.run(transport=transport, **kwargs)
+        # For Docker/Smithery, bind to 0.0.0.0 so it's accessible from outside container
+        host = kwargs.pop("host", "0.0.0.0")
+        port = kwargs.pop("port", 8000)
+        mcp_server.run(transport=transport, host=host, port=port, **kwargs)
     finally:
         # Restore original
         uvicorn.run = original_uvicorn_run
+        if server_patched:
+            try:
+                import uvicorn.server
+                uvicorn.server.Server.__init__ = original_server_init
+            except (AttributeError, ImportError):
+                pass
