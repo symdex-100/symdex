@@ -355,10 +355,30 @@ def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: An
                 return True
         return False
 
+    def add_cors_for_mcp(app_obj: Any) -> None:
+        """Add CORS middleware so gateways (e.g. Smithery) can read Mcp-Session-Id."""
+        if not hasattr(app_obj, "add_middleware"):
+            return
+        try:
+            from starlette.middleware.cors import CORSMiddleware
+            # Expose Mcp-Session-Id so remote clients (Smithery Gateway) can complete init
+            app_obj.add_middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_credentials=False,
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type", "Authorization", "Mcp-Session-Id", "mcp-session-id"],
+                expose_headers=["Mcp-Session-Id", "mcp-session-id"],
+            )
+            logger.info("Added CORS middleware (expose Mcp-Session-Id for remote gateways)")
+        except ImportError:
+            logger.debug("CORSMiddleware not available, skipping CORS")
+
     def patched_uvicorn_run(app_obj: Any, *args: Any, **uvicorn_kwargs: Any) -> None:
-        """Patch uvicorn.run to add server-card route before running."""
+        """Patch uvicorn.run: add server-card route and CORS for Smithery/remote gateways."""
         logger.debug(f"uvicorn.run called - app type: {type(app_obj)}")
         add_server_card_route(app_obj)
+        add_cors_for_mcp(app_obj)
         return original_uvicorn_run(app_obj, *args, **uvicorn_kwargs)
 
     # Also patch uvicorn.Server.__init__ in case FastMCP uses Server directly
@@ -367,11 +387,12 @@ def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: An
         original_server_init = uvicorn.server.Server.__init__
         
         def patched_server_init(self: Any, config: Any, *args: Any, **kwargs: Any) -> None:
-            """Patch Server.__init__ to add server-card route."""
+            """Patch Server.__init__ to add server-card route and CORS."""
             original_server_init(self, config, *args, **kwargs)
             if hasattr(config, "app"):
                 logger.debug(f"uvicorn.Server.__init__ - app type: {type(config.app)}")
                 add_server_card_route(config.app)
+                add_cors_for_mcp(config.app)
         
         uvicorn.server.Server.__init__ = patched_server_init
         server_patched = True
