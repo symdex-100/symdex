@@ -635,7 +635,7 @@ docker run -v /host/project:/data symdex-100 \
 The default container command runs the MCP server with **HTTP (Streamable)** transport for remote clients (Smithery, HTTP-based MCP clients):
 
 ```bash
-# Default: symdex mcp --transport http (listens on 0.0.0.0:8000 for remote connections)
+# Default: symdex mcp --transport streamable-http (listens on 0.0.0.0:8000 for remote connections)
 docker run -p 8000:8000 -v /host/project:/data -e ANTHROPIC_API_KEY=sk-... symdex-100
 ```
 
@@ -645,9 +645,9 @@ For **stdio** (e.g. local Cursor talking to a container), override the command:
 docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
 ```
 
-With docker-compose, the default service runs `symdex mcp --transport http`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
+With docker-compose, the default service runs `symdex mcp --transport streamable-http`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
 
-**Smithery deployment:** The repo includes `smithery.yaml` (container runtime, optional config schema for API keys) and serves `/.well-known/mcp/server-card.json` from the MCP server for Smithery scanning. No separate CI step is required for Smithery; connect the repo in Smithery and deploy. Optional: use GitHub Actions (`.github/workflows/ci.yml` for tests, `release.yml` for tagged releases).
+**Smithery deployment:** The repo includes `smithery.yaml` (container runtime, config schema with `x-from` for API key headers). The MCP server uses **Streamable HTTP** and exposes the **`/mcp`** endpoint; it also serves **`/.well-known/mcp/server-card.json`** for metadata scanning. To publish: connect the repo at [smithery.ai/new](https://smithery.ai/new) (hosted) or use "Bring your own hosting" and enter your server's public URL (e.g. `https://your-domain.com/mcp`). Optional: use GitHub Actions (`.github/workflows/ci.yml`, `release.yml`) for tests and releases.
 
 ---
 

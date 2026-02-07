@@ -20,5 +20,5 @@ RUN pip install --no-cache-dir ".[${EXTRAS}]"
 # Override for CLI: docker run ... symdex --help   or   symdex index /data
 # For stdio (local Cursor): docker run -it ... symdex mcp --transport stdio
 EXPOSE 8000
-ENV MCP_TRANSPORT=http
+ENV MCP_TRANSPORT=streamable-http
 CMD ["sh", "-c", "symdex mcp --transport ${MCP_TRANSPORT}"]
