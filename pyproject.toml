@@ -62,6 +62,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+filterwarnings = [
+    "ignore:.*asyncio\\.(iscoroutinefunction|get_event_loop_policy|set_event_loop_policy).*:DeprecationWarning",
+    "ignore:.*asyncio.*deprecated.*3\\.16.*:DeprecationWarning",
+]
 
 [tool.black]
 line-length = 100

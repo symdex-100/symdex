@@ -473,4 +473,46 @@ Objects are codebase-specific (User, Order, Email, Token). The `COMMON_OBJECT_CO
 
 ---
 
+## Third-party integration and embedding
+
+Symdex is designed to be embedded in agentic systems, backends, and MCP clients. This section documents behaviour relevant to integrators.
+
+### Public API surface
+
+- **Entry point**: `from symdex import Symdex`. One facade; no global state.
+- **Config**: `SymdexConfig.from_env()` or explicit `SymdexConfig(...)`. Use `validate_on_init=True` when constructing `Symdex(...)` to fail fast on missing API keys (optional; omit when using `cypher_fallback_only`).
+- **Data types**: `IndexResult` and `SearchResult` both expose `.to_dict()` for JSON/API responses.
+- **Status**: `symdex.health()` (module-level) or `client.health()` return `{version, llm_provider, cypher_fallback_only}` without touching the index or network.
+- **Version**: `symdex.__version__`.
+
+### Thread and process safety
+
+- **Single process**: The client and `CypherCache` are safe for **multi-threaded** use in one process. The cache uses thread-local SQLite connections; the client’s engine cache is keyed by path.
+- **Index**: The index is a single SQLite file under `.symdex/`. Concurrent reads are fine; concurrent writes (e.g. two indexers on the same directory) are not coordinated. For multi-process setups, run one indexer per index or serialise indexing.
+
+### Path semantics in search results
+
+- **`SearchResult.file_path`**: Stored as resolved at index time (typically **absolute**). Use as-is for opening files.
+- **`SearchResult.path_root`**: When set, this is the index root (e.g. project path). Use `os.path.relpath(result.file_path, result.path_root)` for display or API responses that need relative paths.
+
+### Dependencies and minimal installs
+
+- **Default**: `pip install symdex-100` pulls in `click` and `tqdm` (CLI and progress bars). No LLM SDK is required by default.
+- **LLM**: Install at least one of `symdex-100[anthropic]`, `symdex-100[openai]`, `symdex-100[gemini]` when using the LLM. Without any, set `cypher_fallback_only=True` or `SYMDEX_CYPHER_FALLBACK_ONLY=1` to use rule-based Cyphers only.
+- **MCP**: `pip install 'symdex-100[mcp]'` for the MCP server. The CLI entry point `symdex` works with the default install.
+
+### MCP server configuration
+
+- **One config per server**: `create_server(config=...)` uses a single `SymdexConfig` for all tool calls. Environment variables (or the passed config) apply to every invocation. For per-request or per-tenant config, run separate processes or a future callback-based config resolver.
+
+### Async API and exceptions
+
+- **Async methods**: `aindex`, `asearch`, `asearch_by_cypher`, `astats` run the sync implementation off the event loop via `asyncio.to_thread()`. They raise the **same exceptions** as the sync methods (e.g. `IndexNotFoundError`, `ConfigError`). No extra exception types.
+
+### Environment variables for embedding
+
+- **No-LLM mode**: `SYMDEX_CYPHER_FALLBACK_ONLY=1` (or `true`/`yes`/`on`) makes `SymdexConfig.from_env()` set `cypher_fallback_only=True`, so no API key is required.
+
+---
+
 **Built for production. Designed for speed. Optimized for accuracy.**

@@ -65,6 +65,7 @@ def indexed_project(tmp_path, config):
         "[email] → bool",
         "O(1)",
     )
+    cache.close()  # avoid ResourceWarning: unclosed database
     return tmp_path
 
 

@@ -48,6 +48,22 @@ from symdex.exceptions import (
     SymdexError,
 )
 
+
+def health(config: SymdexConfig | None = None) -> dict:
+    """
+    Return a small status dict for agents or REST health checks (no index/network).
+
+    Use for readiness probes or reporting which provider/version is active.
+    When *config* is None, uses :meth:`SymdexConfig.from_env()` for the snapshot.
+    """
+    cfg = config or SymdexConfig.from_env()
+    return {
+        "version": __version__,
+        "llm_provider": cfg.llm_provider,
+        "cypher_fallback_only": getattr(cfg, "cypher_fallback_only", False),
+    }
+
+
 __all__ = [
     "__version__",
     # Facade
@@ -65,4 +81,6 @@ __all__ = [
     "IndexingError",
     "SearchError",
     "CypherValidationError",
+    # Status
+    "health",
 ]

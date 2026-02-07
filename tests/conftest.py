@@ -5,9 +5,17 @@ Shared fixtures for the Symdex-100 test suite.
 import os
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
+
+# Filter deprecation warnings from pytest-asyncio (Python 3.16 prep); we cannot fix the library.
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module="pytest_asyncio",
+)
 
 # Ensure the src/ directory is on the import path so that
 # symdex.core.config / symdex.core.engine / etc. can be imported.

@@ -36,6 +36,12 @@ def create_server(config: SymdexConfig | None = None):
     """
     Build and return a configured FastMCP server instance.
 
+    Uses a **single config for the whole server**: all tool invocations
+    (search, index, stats) share the same provider, API key, and
+    settings. For multi-tenant or per-request config (e.g. different
+    API keys per workspace), run separate server processes or a future
+    callback-based config resolver.
+
     Args:
         config: Instance-based configuration.  Defaults to
             ``SymdexConfig.from_env()`` so that the server respects

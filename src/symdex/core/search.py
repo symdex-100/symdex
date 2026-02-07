@@ -59,6 +59,7 @@ class CypherSearchEngine:
         generator: CypherGenerator | None = None,
     ):
         self._config = config or SymdexConfig.from_env()
+        self._cache_dir = cache_dir
         self.cache = CypherCache(self._config.get_cache_path(cache_dir))
         # Lazy generator — only created when an LLM-based search is needed
         self._generator = generator
@@ -124,7 +125,11 @@ class CypherSearchEngine:
         if len(patterns) > 1:
             raw_results = self._tiered_multi_lane_search(query, patterns, max_results)
         else:
-            raw_results = self._multi_lane_search(query, primary_pattern, max_results)
+            # When query is a Cypher pattern (e.g. from search_by_cypher), only use Cypher lanes
+            cypher_only = query.strip() == primary_pattern.strip()
+            raw_results = self._multi_lane_search(
+                query, primary_pattern, max_results, cypher_only=cypher_only
+            )
 
         # Score against the tight (primary) pattern so precise matches rank highest
         search_results = self._process_results(raw_results, primary_pattern, query)
@@ -144,8 +149,9 @@ class CypherSearchEngine:
     # ── Query analysis helpers ────────────────────────────────────
 
     def _is_cypher_pattern(self, query: str) -> bool:
-        """Check if query is already in Cypher format."""
-        pattern = r'^[A-Z*]{2,3}:[A-Z*]{3}_[A-Z0-9*]{2,20}--[A-Z*]{3}$'
+        """Check if query is already in Cypher format (allows * wildcards in any slot)."""
+        # DOM:ACT_OBJ--PAT; allow 1–3 chars per slot so "*" is valid
+        pattern = r'^[A-Z*]{1,3}:[A-Z*]{1,3}_[A-Z0-9*]{1,20}--[A-Z*]{1,3}$'
         return bool(re.match(pattern, query.strip()))
 
     def _translate_with_llm(self, query: str) -> List[str]:
@@ -229,22 +235,22 @@ class CypherSearchEngine:
         return merged
 
     def _multi_lane_search(self, query: str, cypher_pattern: str,
-                           max_results: int) -> List[Dict[str, Any]]:
+                           max_results: int,
+                           cypher_only: bool = False) -> List[Dict[str, Any]]:
         """
-        Always-on multi-lane search.
-
-        Runs several parallel retrieval strategies and merges unique
-        results for unified ranking.
+        Multi-lane search; merges unique results for unified ranking.
 
         Lanes:
-          1. Exact Cypher pattern     — highest precision
-          2. Domain-wildcarded Cypher  — cross-domain recall
-          3. Action-only Cypher        — broadest Cypher recall
-          4. Tag keyword search        — semantic tags
-          5. Function name search      — literal name matching
+          1. Exact Cypher pattern       — highest precision
+          2. Domain-wildcarded Cypher   — cross-domain recall
+          3. Action-only Cypher         — broadest Cypher recall
+          4. Tag keyword search         — semantic tags (skipped if cypher_only)
+          5. Function name search       — literal name matching (skipped if cypher_only)
+
+        When cypher_only is True (e.g. from search_by_cypher), only lanes 1–3
+        run so results are strictly Cypher-pattern matches.
         """
         fetch_limit = max(max_results * 5, 30)
-        # Tag/name lanes use a smaller limit to avoid flooding the pool with generic keyword hits
         fetch_limit_tag = min(fetch_limit, 50)
 
         seen: set = set()
@@ -266,7 +272,8 @@ class CypherSearchEngine:
         parts = cypher_pattern.split(":")
         if len(parts) == 2:
             dom, rest_str = parts
-            if dom != "*":
+            # Skip when rest is fully wildcard (*_*--*) or we'd match the whole index
+            if dom != "*" and rest_str.strip() != "*_*--*":
                 _add(self.cache.search_by_cypher(
                     f"*:{rest_str}", limit=fetch_limit
                 ))
@@ -274,27 +281,29 @@ class CypherSearchEngine:
             rest_str = cypher_pattern
 
         # ── Lane 3: Action-only (broadest Cypher) ────────────────
-        # Skip when pattern is already *:ACT_*--* (Lane 2 would return the same set)
         rest = rest_str.split("--")
         if len(rest) == 2:
             act_obj = rest[0].split("_")
             if len(act_obj) == 2:
                 act, obj = act_obj[0], act_obj[1]
                 pat = rest[1]
-                # Only run if Lane 3 would differ from Lane 2 (i.e. object or pattern is specific)
                 if act != "*" and (obj != "*" or pat != "*"):
                     _add(self.cache.search_by_cypher(
                         f"*:{act}_*--*", limit=fetch_limit
                     ))
 
-        # ── Lane 4: Tag keyword search ───────────────────────────
-        keywords = self._extract_keywords(query)
-        for kw in keywords[:5]:
-            _add(self.cache.search_by_tags(kw, limit=fetch_limit_tag))
+        if cypher_only:
+            keywords = []
+            logger.debug("Direct Cypher search: tag/name lanes skipped")
+        else:
+            # ── Lane 4: Tag keyword search ───────────────────────────
+            keywords = self._extract_keywords(query)
+            for kw in keywords[:5]:
+                _add(self.cache.search_by_tags(kw, limit=fetch_limit_tag))
 
-        # ── Lane 5: Function name search ─────────────────────────
-        if keywords:
-            _add(self.cache.search_by_name(keywords, limit=fetch_limit_tag))
+            # ── Lane 5: Function name search ─────────────────────────
+            if keywords:
+                _add(self.cache.search_by_name(keywords, limit=fetch_limit_tag))
 
         # Cap total candidates to avoid scoring huge sets
         cap = self._config.max_search_candidates or (max_results * 10)
@@ -339,6 +348,7 @@ class CypherSearchEngine:
                 file_cache
             )
             
+            path_root = str(self._cache_dir.parent) if self._cache_dir else ""
             search_results.append(SearchResult(
                 file_path=result['file_path'],
                 function_name=func_name,
@@ -346,7 +356,8 @@ class CypherSearchEngine:
                 line_end=result['line_end'],
                 cypher=result['cypher'],
                 score=score,
-                context=context
+                context=context,
+                path_root=path_root,
             ))
         
         return search_results
@@ -472,7 +483,7 @@ class ResultFormatter:
 
     @staticmethod
     def format_json(results: List[SearchResult]) -> str:
-        """Format results as JSON (full paths, all fields)."""
+        """Format results as JSON (full paths, all fields). Includes path_root when set."""
         json_results = [
             {
                 "function_name": r.function_name,
@@ -483,6 +494,7 @@ class ResultFormatter:
                 "score": round(r.score, 2),
                 "language": ResultFormatter._detect_language(r.file_path),
                 "context": r.context,
+                **({"path_root": r.path_root} if r.path_root else {}),
             }
             for r in results
         ]

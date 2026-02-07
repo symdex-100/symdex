@@ -616,6 +616,8 @@ export SYMDEX_MAX_CONCURRENT=10
 
 ## Docker Usage
 
+The image includes MCP server support by default (install extras: `anthropic,mcp`). Override with build arg `EXTRAS` (e.g. `openai,mcp` or `llm-all,mcp`) if needed.
+
 ```bash
 # Index a project
 docker run -v /host/project:/data symdex-100 \
@@ -627,6 +629,23 @@ docker run -v /host/project:/data symdex-100 \
 ```
 
 **Note:** `--cache-dir` must be the path *inside* the container.
+
+### Running the MCP server in Docker (e.g. Smithery)
+
+The default container command runs the MCP server with **SSE** transport so remote clients (Smithery gateway, HTTP-based MCP clients) can connect:
+
+```bash
+# Default: symdex mcp --transport sse (listens for remote connections)
+docker run -p 8000:8000 -v /host/project:/data -e ANTHROPIC_API_KEY=sk-... symdex-100
+```
+
+For **stdio** (e.g. local Cursor talking to a container), override the command:
+
+```bash
+docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
+```
+
+With docker-compose, the default service runs `symdex mcp --transport sse`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
 
 ---
 
@@ -800,6 +819,27 @@ for h in hits:
 # Direct pattern search (no LLM call needed)
 hits = client.search_by_cypher("*:VAL_*--*", path=".")
 ```
+
+### 3b. Manually test the API with an example repository
+
+To index a directory and run example searches in one go (index → stats → natural-language search → Cypher pattern search):
+
+```bash
+# Index and search this repo's src/ (default)
+python scripts/try_api.py
+
+# Use a specific folder
+python scripts/try_api.py src
+python scripts/try_api.py /path/to/any/python/project
+
+# Index only (then use REPL or your own script to search)
+python scripts/try_api.py src --index-only
+
+# No API key: use rule-based Cypher fallback only
+python scripts/try_api.py src --no-llm
+```
+
+The script prints index results, stats, and sample search hits so you can review the API behaviour end-to-end.
 
 ### 4. Use from another local project
 
