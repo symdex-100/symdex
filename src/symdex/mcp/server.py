@@ -54,14 +54,7 @@ def create_server(config: SymdexConfig | None = None):
 
     cfg = config or SymdexConfig.from_env()
 
-    mcp = FastMCP(
-        "Symdex-100",
-        description=(
-            "Inline semantic fingerprints for 100x faster code search. "
-            "Indexes Python functions and lets you search by intent using "
-            "structured Cypher patterns."
-        ),
-    )
+    mcp = FastMCP("Symdex-100")
 
     # ==================================================================
     # Helper — resolve cache path with proper error handling
