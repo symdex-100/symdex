@@ -294,35 +294,77 @@ def create_server(config: SymdexConfig | None = None):
             "gaps or areas that might need attention."
         )
 
-    # Serve /.well-known/mcp/server-card.json for Smithery server scanning
-    # (https://smithery.ai/docs/build/external#server-scanning)
-    _SERVER_CARD = {
-        "serverInfo": {"name": "Symdex-100", "version": "1.1.0"},
-        "authentication": {"required": False, "schemes": []},
-        "tools": [
-            {"name": "search_codebase", "description": "Search the Symdex index by natural-language or Cypher pattern.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
-            {"name": "search_by_cypher", "description": "Find code matching a Cypher-100 pattern (no LLM).", "inputSchema": {"type": "object", "properties": {"cypher_pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}}},
-            {"name": "index_directory", "description": "Index source files into .symdex/ sidecar.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}}}},
-            {"name": "get_index_stats", "description": "Return index statistics for a directory.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
-            {"name": "health", "description": "Server readiness check.", "inputSchema": {"type": "object", "properties": {}}},
-        ],
-        "resources": [
-            {"uri": "symdex://schema/domains", "description": "Cypher domain codes"},
-            {"uri": "symdex://schema/actions", "description": "Cypher action codes"},
-            {"uri": "symdex://schema/patterns", "description": "Cypher pattern codes"},
-            {"uri": "symdex://schema/full", "description": "Complete Cypher-100 schema"},
-        ],
-        "prompts": [
-            {"name": "find_security_functions", "description": "Find all security-related functions"},
-            {"name": "audit_domain", "description": "Audit all functions in a domain"},
-            {"name": "explore_codebase", "description": "High-level codebase overview"},
-        ],
-    }
-    if hasattr(mcp, "custom_route"):
-        # FastMCP custom_route for Smithery scanning
-        async def _serve_server_card(request: Any) -> Any:
-            from starlette.responses import JSONResponse
-            return JSONResponse(_SERVER_CARD)
-        mcp.custom_route("/.well-known/mcp/server-card.json", methods=["GET"])(_serve_server_card)
-
     return mcp
+
+
+# Server card JSON for Smithery scanning (https://smithery.ai/docs/build/external#server-scanning)
+SERVER_CARD = {
+    "serverInfo": {"name": "Symdex-100", "version": "1.1.0"},
+    "authentication": {"required": False, "schemes": []},
+    "tools": [
+        {"name": "search_codebase", "description": "Search the Symdex index by natural-language or Cypher pattern.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
+        {"name": "search_by_cypher", "description": "Find code matching a Cypher-100 pattern (no LLM).", "inputSchema": {"type": "object", "properties": {"cypher_pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}}},
+        {"name": "index_directory", "description": "Index source files into .symdex/ sidecar.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}}}},
+        {"name": "get_index_stats", "description": "Return index statistics for a directory.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+        {"name": "health", "description": "Server readiness check.", "inputSchema": {"type": "object", "properties": {}}},
+    ],
+    "resources": [
+        {"uri": "symdex://schema/domains", "description": "Cypher domain codes"},
+        {"uri": "symdex://schema/actions", "description": "Cypher action codes"},
+        {"uri": "symdex://schema/patterns", "description": "Cypher pattern codes"},
+        {"uri": "symdex://schema/full", "description": "Complete Cypher-100 schema"},
+    ],
+    "prompts": [
+        {"name": "find_security_functions", "description": "Find all security-related functions"},
+        {"name": "audit_domain", "description": "Audit all functions in a domain"},
+        {"name": "explore_codebase", "description": "High-level codebase overview"},
+    ],
+}
+
+
+def run_with_server_card(mcp_server: Any, transport: str = "stdio", **kwargs: Any) -> None:
+    """
+    Run the MCP server, adding server-card route for SSE transport.
+
+    For SSE transport, intercepts FastMCP's app creation via uvicorn.run patching
+    to add /.well-known/mcp/server-card.json route for Smithery scanning.
+    """
+    if transport != "sse":
+        mcp_server.run(transport=transport, **kwargs)
+        return
+
+    # For SSE, patch uvicorn.run to intercept FastMCP's app and add server-card route
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+    import uvicorn
+
+    async def serve_server_card(request: Any) -> JSONResponse:
+        """Serve the server-card JSON for Smithery scanning."""
+        return JSONResponse(SERVER_CARD)
+
+    # Patch uvicorn.run to add server-card route to any Starlette/FastAPI app
+    original_uvicorn_run = uvicorn.run
+
+    def patched_uvicorn_run(app_obj: Any, *args: Any, **uvicorn_kwargs: Any) -> None:
+        """Patch uvicorn.run to add server-card route before running."""
+        # Check if app has routes (Starlette/FastAPI)
+        if hasattr(app_obj, "routes") and isinstance(app_obj.routes, list):
+            # Check if route already exists
+            route_exists = any(
+                hasattr(route, "path") and route.path == "/.well-known/mcp/server-card.json"
+                for route in app_obj.routes
+            )
+            if not route_exists:
+                app_obj.routes.append(
+                    Route("/.well-known/mcp/server-card.json", serve_server_card, methods=["GET"])
+                )
+                logger.info("Added server-card route: /.well-known/mcp/server-card.json")
+        return original_uvicorn_run(app_obj, *args, **uvicorn_kwargs)
+
+    # Apply patch
+    uvicorn.run = patched_uvicorn_run
+    try:
+        mcp_server.run(transport=transport, **kwargs)
+    finally:
+        # Restore original
+        uvicorn.run = original_uvicorn_run
