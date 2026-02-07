@@ -329,13 +329,11 @@ def mcp(ctx: click.Context, transport: str, verbose: bool):
         )
         raise SystemExit(1)
 
-    import os
     from symdex.mcp.server import create_server, run_with_server_card
 
     server = create_server(config=cfg)
-    # Respect PORT for Fly.io, Railway, etc. (default 8000)
-    port = int(os.environ.get("PORT", "8000"))
-    run_with_server_card(server, transport=transport, port=port)
+    # PORT env is respected inside run_with_server_card (Fly.io/Railway use 8080)
+    run_with_server_card(server, transport=transport)
 
 
 # ---------------------------------------------------------------------------
