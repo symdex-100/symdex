@@ -67,8 +67,11 @@ If Symdex is configured as an MCP server, you have these tools:
 
 **Your primary tool.** Pass a natural-language query or Cypher pattern.
 
+- **Natural language:** The LLM returns **three** Cypher patterns (tight, medium, broad). The engine tries the tight pattern first and only broadens if needed, so you get fewer irrelevant results and faster, more focused hits. Results are ranked against the tight pattern.
+- **Reported time** in tool output is **DB-only** (index lookup, scoring, context); LLM translation time is not included.
+
 ```
-# Natural language → translated to Cypher automatically
+# Natural language → tiered Cypher (tight first)
 search_codebase("where do we validate user tokens")
 
 # Direct Cypher pattern (if you already know the shape)
@@ -216,8 +219,10 @@ results by relevance.
 | Approach | Tokens used | Accuracy |
 |----------|------------|----------|
 | Read 10 files to find a function | ~5,000 | Low (might miss it) |
-| `search_codebase("validate password")` | ~100 | High (ranked results) |
+| `search_codebase("validate password")` | ~100 | High (ranked, tiered precision) |
 | **Savings** | **50x fewer tokens** | **Higher accuracy** |
+
+Natural-language search uses **tiered Cypher** (tight → medium → broad) and a **candidate cap** so result sets stay focused (e.g. dozens of high-quality hits instead of hundreds of noisy ones).
 
 **Rule of thumb:** If you would otherwise read more than 3 files to
 answer a question, try Symdex first.

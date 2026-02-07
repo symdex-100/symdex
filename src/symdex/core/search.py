@@ -13,6 +13,7 @@ Production-ready with:
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import re
@@ -61,6 +62,8 @@ class CypherSearchEngine:
         self.cache = CypherCache(self._config.get_cache_path(cache_dir))
         # Lazy generator — only created when an LLM-based search is needed
         self._generator = generator
+        # Time (seconds) of last search from DB query start to result list (excludes LLM translation)
+        self._last_db_elapsed_seconds: float = 0.0
 
     @property
     def generator(self) -> CypherGenerator:
@@ -73,6 +76,15 @@ class CypherSearchEngine:
     def generator(self, value: CypherGenerator):
         """Allow direct injection (used by tests and the facade)."""
         self._generator = value
+
+    @property
+    def last_search_db_elapsed_seconds(self) -> float:
+        """
+        Elapsed time (seconds) of the last search from DB query start to
+        result list. Excludes LLM/keyword translation; use for reported
+        "search time" so users see index lookup performance.
+        """
+        return self._last_db_elapsed_seconds
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -91,30 +103,43 @@ class CypherSearchEngine:
         """
         max_results = max_results or self._config.max_search_results
 
-        # Determine Cypher pattern from the query
+        # Resolve to a list of Cypher patterns (1 = single, 3 = tiered tight/medium/broad)
         if self._is_cypher_pattern(query):
-            cypher_pattern = query
-            logger.info(f"Direct Cypher search: {cypher_pattern}")
+            patterns = [query]
+            logger.info(f"Direct Cypher search: {query}")
         else:
             if strategy in ("llm", "auto"):
-                cypher_pattern = self._translate_with_llm(query)
+                patterns = self._translate_with_llm(query)
             else:
-                cypher_pattern = self._translate_with_keywords(query)
-            logger.info(f"Query: '{query}' → Cypher: '{cypher_pattern}'")
+                patterns = [self._translate_with_keywords(query)]
+            if len(patterns) > 1:
+                logger.info(f"Query: '{query}' → Cypher (tiered): {patterns}")
+            else:
+                logger.info(f"Query: '{query}' → Cypher: '{patterns[0]}'")
 
-        # Always-on multi-lane retrieval
-        raw_results = self._multi_lane_search(query, cypher_pattern, max_results)
+        primary_pattern = patterns[0]
 
-        # Score, rank, limit
-        search_results = self._process_results(raw_results, cypher_pattern, query)
+        # Time only DB + scoring + context (exclude LLM/keyword translation)
+        t0 = time.perf_counter()
+        if len(patterns) > 1:
+            raw_results = self._tiered_multi_lane_search(query, patterns, max_results)
+        else:
+            raw_results = self._multi_lane_search(query, primary_pattern, max_results)
+
+        # Score against the tight (primary) pattern so precise matches rank highest
+        search_results = self._process_results(raw_results, primary_pattern, query)
         search_results.sort()
+        self._last_db_elapsed_seconds = time.perf_counter() - t0
         return search_results[:max_results]
 
     def search_by_tag(self, tag: str, max_results: int = None) -> List[SearchResult]:
         """Search for functions by tag."""
         max_results = max_results or self._config.max_search_results
+        t0 = time.perf_counter()
         raw_results = self.cache.search_by_tags(tag, limit=max_results)
-        return self._process_results(raw_results, None, tag)
+        search_results = self._process_results(raw_results, None, tag)
+        self._last_db_elapsed_seconds = time.perf_counter() - t0
+        return search_results
 
     # ── Query analysis helpers ────────────────────────────────────
 
@@ -123,13 +148,13 @@ class CypherSearchEngine:
         pattern = r'^[A-Z*]{2,3}:[A-Z*]{3}_[A-Z0-9*]{2,20}--[A-Z*]{3}$'
         return bool(re.match(pattern, query.strip()))
 
-    def _translate_with_llm(self, query: str) -> str:
-        """Translate natural language query to Cypher using LLM."""
+    def _translate_with_llm(self, query: str) -> List[str]:
+        """Translate natural language query to 1–3 Cypher patterns (tiered) using LLM."""
         try:
             return self.generator.translate_query(query)
         except Exception as e:
             logger.warning(f"LLM translation failed: {e}. Falling back to keywords.")
-            return self._translate_with_keywords(query)
+            return [self._translate_with_keywords(query)]
 
     def _translate_with_keywords(self, query: str) -> str:
         """Translate query using keyword matching (fast fallback)."""
@@ -179,6 +204,30 @@ class CypherSearchEngine:
 
     # ── Multi-lane retrieval ──────────────────────────────────────
 
+    def _tiered_multi_lane_search(
+        self, query: str, patterns: List[str], max_results: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Run multi-lane search for each pattern in order (tight → medium → broad),
+        merging and deduplicating. Stops once we have enough candidates
+        (max_results * 2) so we don't over-fetch from broad patterns.
+        """
+        merged: List[Dict[str, Any]] = []
+        seen: set = set()
+        threshold = max_results * 2
+
+        for cypher_pattern in patterns:
+            raw = self._multi_lane_search(query, cypher_pattern, max_results)
+            for r in raw:
+                key = (r["file_path"], r["function_name"], r.get("line_start", 0))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(r)
+            if len(merged) >= threshold:
+                break
+
+        return merged
+
     def _multi_lane_search(self, query: str, cypher_pattern: str,
                            max_results: int) -> List[Dict[str, Any]]:
         """
@@ -195,6 +244,8 @@ class CypherSearchEngine:
           5. Function name search      — literal name matching
         """
         fetch_limit = max(max_results * 5, 30)
+        # Tag/name lanes use a smaller limit to avoid flooding the pool with generic keyword hits
+        fetch_limit_tag = min(fetch_limit, 50)
 
         seen: set = set()
         merged: List[Dict[str, Any]] = []
@@ -223,12 +274,15 @@ class CypherSearchEngine:
             rest_str = cypher_pattern
 
         # ── Lane 3: Action-only (broadest Cypher) ────────────────
+        # Skip when pattern is already *:ACT_*--* (Lane 2 would return the same set)
         rest = rest_str.split("--")
         if len(rest) == 2:
             act_obj = rest[0].split("_")
             if len(act_obj) == 2:
-                act = act_obj[0]
-                if act != "*":
+                act, obj = act_obj[0], act_obj[1]
+                pat = rest[1]
+                # Only run if Lane 3 would differ from Lane 2 (i.e. object or pattern is specific)
+                if act != "*" and (obj != "*" or pat != "*"):
                     _add(self.cache.search_by_cypher(
                         f"*:{act}_*--*", limit=fetch_limit
                     ))
@@ -236,11 +290,16 @@ class CypherSearchEngine:
         # ── Lane 4: Tag keyword search ───────────────────────────
         keywords = self._extract_keywords(query)
         for kw in keywords[:5]:
-            _add(self.cache.search_by_tags(kw, limit=fetch_limit))
+            _add(self.cache.search_by_tags(kw, limit=fetch_limit_tag))
 
         # ── Lane 5: Function name search ─────────────────────────
         if keywords:
-            _add(self.cache.search_by_name(keywords, limit=fetch_limit))
+            _add(self.cache.search_by_name(keywords, limit=fetch_limit_tag))
+
+        # Cap total candidates to avoid scoring huge sets
+        cap = self._config.max_search_candidates or (max_results * 10)
+        if cap > 0 and len(merged) > cap:
+            merged = merged[:cap]
 
         logger.debug(
             f"Multi-lane: {len(merged)} unique candidates "

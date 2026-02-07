@@ -122,52 +122,57 @@ This 18-character string replaces 2,000+ characters of function body for search 
 
 **Solution**: Symdex searches 20-byte Cyphers in a SQLite B-tree index.
 
-| Metric | Grep | Symdex | Improvement |
-|--------|------|--------|-------------|
+| Metric | Grep | Symdex (DB only) | Improvement |
+|--------|------|------------------|-------------|
 | Data scanned per query | ~50MB (full codebase) | ~100KB (index) | **500x less I/O** |
-| Query time (5,000 functions) | 800ms | 8ms | **100x faster** |
+| Index lookup (5,000 functions) | 800ms | 8ms | **100x faster** |
 | Index size | N/A (no index) | 2MB | **25:1 compression** |
 
 **Technical details:**
 - SQLite B-tree: O(log N) lookups with compound indexes on `(cypher, tags, function_name)`
-- Multi-lane parallel retrieval: 5 concurrent strategies merged in <10ms
+- Tiered Cypher + multi-lane retrieval; candidate cap (default 200) keeps latency and result size bounded
 - Incremental indexing: SHA256 hash tracking skips unchanged files
+- **Reported search time** in CLI/API is index lookup only (excludes LLM translation for natural-language queries)
 
-**Result**: Sub-second search on 10,000+ function codebases.
+**Result**: Sub-second index lookup on 10,000+ function codebases.
 
 ---
 
 ### 2. **Search Accuracy**
 
-**Problem**: Single search strategies miss valid results (e.g., `SYS:DEL_DIR` won't find `DAT:DEL_DIR` if query specifies system domain).
+**Problem**: Single search strategies miss valid results (e.g., `SYS:DEL_DIR` won't find `DAT:DEL_DIR` if query specifies system domain), or return too many low-quality hits when the Cypher is too broad.
 
-**Solution**: Always-on multi-lane search architecture.
+**Solution**: **Tiered Cypher patterns** plus always-on **multi-lane search**.
+
+**Tiered translation (natural-language queries):** The LLM returns three Cypher patterns — *tight* (no wildcards), *medium* (minimal wildcards), *broad* (fallback). The engine queries the tight pattern first; if the candidate pool is too small, it runs the medium then broad pattern and merges (deduplicated). Results are scored against the tight pattern so precise matches rank highest.
+
+**Multi-lane retrieval** (per pattern):
 
 ```
-Query: "delete directory"
+Query: "delete directory"  →  Tiered: [SYS:SCR_DIR--SYN, SYS:SCR_DIR--*, *:SCR_*--*]
     ↓
 ┌────────────────────────────────────────────────────────────┐
-│ LANE 1: Exact Cypher      │ SYS:DEL_DIR--SYN              │
-│ LANE 2: Domain wildcard   │ *:DEL_DIR--SYN                │
-│ LANE 3: Action-only       │ *:DEL_*--*                    │
-│ LANE 4: Tag keywords      │ delete, directory, recursive  │
-│ LANE 5: Function name     │ _delete_directory_tree        │
+│ LANE 1: Exact Cypher      │ SYS:SCR_DIR--SYN               │
+│ LANE 2: Domain wildcard   │ *:SCR_DIR--SYN                 │
+│ LANE 3: Action-only       │ *:SCR_*--*                     │  
+│ LANE 4: Tag keywords      │ delete, directory  (capped)    │
+│ LANE 5: Function name     │ _delete_directory_tree (capped)│
 └────────────────────────────────────────────────────────────┘
     ↓
-Merge + Deduplicate + Unified Scoring
+Merge + Cap candidates (default 200) + Score against tight pattern
     ↓
-Ranked Results (exact match = highest score)
+Ranked Results (exact match + domain/action/object = highest score)
 ```
 
-**Scoring algorithm:**
+**Scoring:** ACT (action) and OBJ (object) dominate — they encode *what* the function does and *on what*. Domain and pattern follow. Wrong domain (e.g. result is TST when query asked for BIZ) is penalized.
 
 $$
-\text{score} = 10 \cdot [\text{exact}] + 5 \cdot [\text{domain}] + 5 \cdot [\text{action}] + 3 \cdot [\text{object}] + 3 \cdot [\text{name}] + 1.5 \cdot [\text{tags}]
+\text{score} = 10[\text{exact}] + 6[\text{action}] + 5[\text{object}] + 4[\text{domain}] + 2[\text{pattern}] + 3[\text{name}] + 1.5[\text{tags}] - 3[\text{domain mismatch}]
 $$
 
-Where $[\text{x}]$ is 1 if matched, 0 otherwise (with partial matching for substring overlap).
+Where $[\text{x}]$ is 1 if matched, 0 otherwise (with partial matching for names and object similarity).
 
-**Result**: Cross-domain coverage with deterministic, explainable relevance ranking.
+**Result**: High precision from tiered + tight-pattern scoring; cross-domain recall when needed; fewer irrelevant results (candidate cap, Lane 3 skip, smaller tag/name limits).
 
 ---
 
@@ -406,16 +411,12 @@ except ConfigError:
 │   ┌─────────────────────────────────────────────────┐           │
 │   │           MULTI-LANE SEARCH ENGINE              │           │
 │   ├─────────────────────────────────────────────────┤           │
-│   │  Query → [LLM Translation] → Cypher Pattern     │           │
-│   │     ↓                                            │           │
-│   │  5 Parallel Lanes:                              │           │
-│   │    1. Exact Cypher match                        │           │
-│   │    2. Domain wildcard                           │           │
-│   │    3. Action-only                               │           │
-│   │    4. Tag keywords                              │           │
-│   │    5. Function name substring                   │           │
-│   │     ↓                                            │           │
-│   │  Merge → Score → Rank → Format                  │           │
+│   │  Query → [LLM] → 3 Cypher patterns (tight/med/broad)         │
+│   │     ↓  Try tight first; merge medium/broad if needed        │
+│   │  5 Lanes per pattern:  Exact │ Domain* │ Act* │ Tags │ Name │
+│   │  (Lane 3 skipped when redundant; tag/name capped)           │
+│   │     ↓  Candidate cap (e.g. 200)                             │
+│   │  Score vs tight pattern → Rank → Format                      │
 │   └─────────────────────────────────────────────────┘           │
 │                        ↓                                         │
 │   Results (100x faster, 50x fewer tokens)                       │
@@ -427,9 +428,10 @@ except ConfigError:
 
 1. **Python AST** (not regex): Handles decorators, nested functions, edge cases
 2. **Sidecar index** (not inline): Source files stay pristine, no diffs
-3. **Multi-lane search** (not single-pattern): Cross-domain recall + precision
-4. **LLM + rule-based fallback**: Semantic accuracy with deterministic backup
-5. **SQLite B-tree**: Zero-config, portable, O(log N) lookups
+3. **Tiered Cypher** (tight → medium → broad): LLM returns 3 patterns; try precise first, broaden only if needed — fewer irrelevant results
+4. **Multi-lane search** (per pattern): Exact, domain wildcard, action-only (when not redundant), tag/name (capped); candidate cap before scoring
+5. **LLM + rule-based fallback**: Semantic accuracy with deterministic backup
+6. **SQLite B-tree**: Zero-config, portable, O(log N) lookups
 
 ---
 
@@ -518,28 +520,38 @@ Agent: "Now I know exactly where to look"
 | Small | 100 | 500 | 45s | 15s |
 | Medium | 500 | 2,500 | 3.5min | 1min |
 | Large | 1,000 | 5,000 | 7min | 2min |
+| **Real-world (≈300k LOC)** | **≈1,000** | **≈2,800** | **≈15min** | **≈5min** |
 | Very Large | 5,000 | 25,000 | 35min | 10min |
 
 **Incremental re-indexing:** ~10% of initial time (only changed files).
 
 ### Search Performance
 
-**Test setup:** 5,000 indexed functions, cold SQLite cache.
+**Reported time:** The CLI and API report **DB-only** search time (multi-lane retrieval, scoring, context extraction). LLM translation for natural-language queries is **not** included.
 
-| Query Complexity | Grep | Symdex | Speedup |
-|-----------------|------|--------|---------|
+**Test setup (small index):** 5,000 indexed functions, cold SQLite cache.
+
+| Query Complexity | Grep | Symdex (DB only) | Speedup |
+|-----------------|------|------------------|---------|
 | Exact match | 450ms | 4ms | **112x** |
 | Wildcard | 780ms | 8ms | **97x** |
 | Multi-term | 1,200ms | 12ms | **100x** |
-| Natural language | N/A | 15ms | ∞ |
+| Natural language | N/A | 15ms + LLM | ∞ |
+
+**Large codebase (≈2,800 functions, ≈458 indexed files):**
+
+| Query | Results | DB time | Note |
+|-------|---------|---------|------|
+| *"force delete data and directory of repository"* | 208 | &lt;1s | Multi-lane, direct-style pattern |
+| *"where does the AI model analyze for dependencies"* | **76** | **0.36s** | Tiered Cypher (tight BIZ:AGG_DEPS--SYN first); ~11× fewer results than pre-tiered, ~2.5× faster |
 
 **Query breakdown (Symdex):**
-- LLM translation: 5ms (cached) / 50ms (first query)
-- Multi-lane retrieval: 3-8ms
-- Scoring + ranking: 1-2ms
-- Context extraction: 2-5ms
+- LLM translation: not included in reported time (one-time per query, ~1–3s depending on provider)
+- Multi-lane retrieval: typically 50–400ms (depends on result count and candidate cap)
+- Scoring + ranking: 1–5ms
+- Context extraction: scales with result count
 
-**Result:** <20ms end-to-end for 95% of queries.
+**Result:** Sub-second index lookup for typical queries; tiered patterns and candidate cap keep result sets focused and fast.
 
 ---
 

@@ -15,7 +15,7 @@ import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor
 
 from symdex.core.config import Config, CypherSchema, Prompts, SymdexConfig
@@ -711,14 +711,19 @@ class CypherGenerator:
         )
         return self._generate_fallback_cypher(metadata)
 
-    def translate_query(self, natural_query: str) -> str:
-        """Translate a natural-language query to a Cypher pattern."""
+    def translate_query(self, natural_query: str) -> List[str]:
+        """
+        Translate a natural-language query to 1–3 Cypher patterns (tiered: tight, medium, broad).
+
+        Returns a list of 1 or 3 patterns. Callers should try the first (tight) pattern,
+        then optionally the next if result count is low, then the third.
+        """
         import time
 
         cfg = self._effective_config
         for attempt in range(1, cfg.retry_attempts + 1):
             try:
-                pattern = self._ensure_llm().complete(
+                raw = self._ensure_llm().complete(
                     system=Prompts.QUERY_TRANSLATION_SYSTEM,
                     user_message=Prompts.QUERY_TRANSLATION_USER.format(
                         query=natural_query,
@@ -726,11 +731,9 @@ class CypherGenerator:
                     max_tokens=cfg.llm_max_tokens,
                     temperature=0.0,
                 )
-                return (
-                    pattern
-                    if self._validate_cypher(pattern, allow_wildcards=True)
-                    else "*:*_*--*"
-                )
+                patterns = self._parse_tiered_cypher_response(raw)
+                if patterns:
+                    return patterns
             except Exception as e:
                 if attempt >= cfg.retry_attempts:
                     logger.error(
@@ -744,8 +747,29 @@ class CypherGenerator:
                 )
                 time.sleep(backoff)
 
-        # Fallback to keyword-based translation if LLM fails
-        return self._keyword_based_translation(natural_query)
+        # Fallback: single keyword-based pattern
+        single = CypherGenerator._keyword_based_translation(natural_query)
+        return [single]
+
+    def _parse_tiered_cypher_response(self, raw: str) -> List[str]:
+        """
+        Parse LLM response into 1–3 valid Cypher patterns (tight, medium, broad).
+        Lines that do not validate are skipped.
+        """
+        valid: List[str] = []
+        for line in raw.strip().splitlines():
+            candidate = line.strip().split("#")[0].strip()  # drop inline comments
+            if candidate and self._validate_cypher(candidate, allow_wildcards=True):
+                valid.append(candidate)
+                if len(valid) >= 3:
+                    break
+        if not valid:
+            return []
+        if len(valid) == 1:
+            return valid
+        if len(valid) == 2:
+            return [valid[0], valid[1], "*:*_*--*"]
+        return valid[:3]
     
     @staticmethod
     def _validate_cypher(cypher: str, allow_wildcards: bool = False) -> bool:
@@ -948,10 +972,12 @@ def calculate_search_score(
     result_parts = result_cypher.split(':')
     
     if len(pattern_parts) == 2 and len(result_parts) == 2:
-        # Domain match
+        # Domain match or explicit mismatch penalty
         if pattern_parts[0] == result_parts[0]:
             score += weights["domain_match"]
-        
+        elif pattern_parts[0] != "*" and result_parts[0] != pattern_parts[0]:
+            score += weights.get("domain_mismatch_penalty", -3.0)
+
         # Action and Object
         pattern_aop = pattern_parts[1].split('--')
         result_aop = result_parts[1].split('--')

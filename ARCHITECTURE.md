@@ -173,7 +173,7 @@ cypher_index:
 
 **Key Features**:
 
-1. **Lazy LLM initialization**: The provider SDK is imported and the client created only on first actual LLM call. This means constructing a `CypherGenerator` or `CypherSearchEngine` does **not** require an API key — you only need a key when you actually call `generate_cypher()` or `translate_query()`.
+1. **Lazy LLM initialization**: The provider SDK is imported and the client created only on first actual LLM call. This means constructing a `CypherGenerator` or `CypherSearchEngine` does **not** require an API key — you only need a key when you actually call `generate_cypher()` or `translate_query()`. For search, `translate_query()` returns a **list of 1–3 Cypher patterns** (tiered: tight, medium, broad) used by the search engine to try precise matches first.
 
 2. **Multi-provider support**: `_create_provider(provider, api_key, config)` factory instantiates the correct `LLMProvider` subclass. Provider name, API key, and model are all read from the `SymdexConfig` instance.
 
@@ -251,51 +251,62 @@ SHA256 hash tracking skips unchanged files. On re-run, 90%+ of files are skipped
 
 ### 4. Search Pipeline (`core/search.py`)
 
-**Purpose**: Translate natural language to Cypher patterns and find matching functions.
+**Purpose**: Translate natural language to Cypher patterns and find matching functions with high precision and manageable result sets.
 
-#### 4.1 Multi-Lane Search Architecture
+#### 4.1 Tiered Cypher + Multi-Lane Search
 
-Instead of relying on a single Cypher pattern, the engine always runs **five** parallel retrieval lanes:
+**Tiered translation (natural-language):** The LLM returns **three** Cypher patterns — *tight* (no/minimal wildcards), *medium*, *broad*. The engine runs multi-lane retrieval for the tight pattern first; if the merged candidate count is below a threshold (e.g. 2× max_results), it runs the medium pattern and merges (deduplicated), then the broad pattern if still needed. All candidates are scored against the **tight** pattern so precise matches rank highest.
+
+**Multi-lane retrieval** (per pattern): Five lanes run; results are merged and deduplicated, then capped.
 
 ```
-Query: "delete directory"
+Query: "where does the AI model analyze for dependencies"
+    → Tiered: [BIZ:AGG_DEPS--SYN, BIZ:AGG_DEPS--*, *:AGG_*--*]
     ↓
+For each pattern (until enough candidates):
 ┌──────────────────────────────────────────────────────────┐
-│ LANE 1: Exact Cypher      │ SYS:SCR_DIR--SYN             │
-│ LANE 2: Domain wildcard   │ *:SCR_DIR--SYN               │
-│ LANE 3: Action-only       │ *:SCR_*--*                   │
-│ LANE 4: Tag keywords      │ delete, directory             │
-│ LANE 5: Function name     │ _delete_directory_tree        │
+│ LANE 1: Exact Cypher      │ BIZ:AGG_DEPS--SYN           │
+│ LANE 2: Domain wildcard   │ *:AGG_DEPS--SYN             │
+│ LANE 3: Action-only       │ *:AGG_*--*  (skipped if OBJ/PAT already *) │
+│ LANE 4: Tag keywords      │ ai, model, analyze, dependencies (limit 50) │
+│ LANE 5: Function name     │ (limit 50)                  │
 └──────────────────────────────────────────────────────────┘
     ↓
-Merge + Deduplicate + Unified Scoring → Ranked Results
+Merge + Cap at max_search_candidates (default 200) → Score against tight → Rank
 ```
+
+- **Lane 3 skip**: When the pattern is already `*:ACT_*--*`, Lane 2 and Lane 3 would return the same set; Lane 3 is skipped.
+- **Tag/name limits**: Lanes 4 and 5 use a smaller per-lane limit (e.g. 50) to avoid flooding the pool with generic keyword hits.
+- **Candidate cap**: After merging, the list is capped (e.g. 200) before scoring to keep latency and result size bounded.
 
 #### 4.2 Query Translation Strategies
 
 | Strategy | Mechanism | Latency | Accuracy |
 |----------|-----------|---------|----------|
-| `auto` (default) | Try LLM, fall back to keyword | ~500ms | High |
-| `llm` | Force LLM translation | ~500ms | Highest |
-| `keyword` | Keyword mapping only | ~1ms | Medium |
-| `direct` | Query is already a Cypher pattern | ~1ms | Exact |
+| `auto` (default) | LLM returns 3 tiered patterns; try tight first, then medium/broad if needed | ~1–3s (LLM) | Highest |
+| `llm` | Same tiered translation | ~1–3s (LLM) | Highest |
+| `keyword` | Single pattern from keyword mapping | ~1ms | Medium |
+| `direct` | Query is already a Cypher pattern (single) | ~1ms | Exact |
 
 #### 4.3 Ranking Algorithm
 
+**Slot priority:** ACT (action) and OBJ (object) dominate — they encode *what* the function does and *on what*. Domain and pattern follow. A **domain mismatch** (e.g. pattern BIZ, result TST) is penalized.
+
 ```python
 WEIGHTS = {
-    "exact_match":      10.0,   # Full Cypher match
-    "domain_match":      5.0,   # SEC = SEC
-    "action_match":      5.0,   # VAL = VAL
-    "object_match":      3.0,   # TOKEN = TOKEN
-    "object_similarity": 2.0,   # DATASET ≈ DSET (Jaccard + substring)
-    "pattern_match":     2.0,   # ASY = ASY
-    "tag_match":         1.5,   # Query words in function tags
-    "name_match":        3.0,   # Query words in function name
+    "exact_match":           10.0,   # Full Cypher match
+    "action_match":          6.0,   # VAL = VAL (primary intent)
+    "object_match":          5.0,   # TOKEN = TOKEN (target entity)
+    "domain_match":          4.0,   # SEC = SEC
+    "object_similarity":     2.0,   # DATASET ≈ DSET (Jaccard + substring)
+    "pattern_match":         2.0,   # ASY = ASY
+    "domain_mismatch_penalty": -3.0,  # Pattern domain specific, result different
+    "tag_match":             1.5,   # Query words in function tags
+    "name_match":            3.0,   # Query words in function name
 }
 ```
 
-Scoring includes exact word overlap and substring matching against function names, with stop-word filtering.
+Scoring includes exact word overlap and substring matching against function names, with stop-word filtering. Results are sorted by score descending; the tight Cypher pattern is used so that exact and slot matches rank above broad-pattern-only hits.
 
 #### 4.4 Result Formatting
 
