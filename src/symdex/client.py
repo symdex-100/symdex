@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from symdex.core.config import SymdexConfig
 from symdex.core.engine import IndexResult, SearchResult
@@ -243,6 +243,98 @@ class Symdex:
         finally:
             cache.close()
 
+    # ── Call Graph ────────────────────────────────────────────────
+
+    def get_callers(
+        self,
+        function_name: str,
+        *,
+        path: str | Path = ".",
+        context_lines: int = 3,
+    ) -> List[SearchResult]:
+        """Find indexed functions that call the specified function.
+
+        Args:
+            function_name: Target function name.
+            path: Root directory whose ``.symdex/`` index to search.
+            context_lines: Lines of code context per result.
+
+        Returns:
+            List of :class:`SearchResult` objects for each caller.
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
+        """
+        cache_dir = Path(path).resolve() / self._config.symdex_dir
+        db = self._config.get_cache_path(cache_dir)
+        if not db.exists():
+            raise IndexNotFoundError(f"No Symdex index found at {db}.")
+        engine = self._get_engine(cache_dir)
+        return engine.get_callers(function_name, context_lines=context_lines)
+
+    def get_callees(
+        self,
+        function_name: str,
+        *,
+        path: str | Path = ".",
+        file_path: str | None = None,
+        context_lines: int = 3,
+    ) -> List[SearchResult]:
+        """Find indexed functions called by the specified function.
+
+        Args:
+            function_name: Caller function name.
+            path: Root directory whose ``.symdex/`` index to search.
+            file_path: Optional source file path for disambiguation.
+            context_lines: Lines of code context per result.
+
+        Returns:
+            List of :class:`SearchResult` objects for each callee.
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
+        """
+        cache_dir = Path(path).resolve() / self._config.symdex_dir
+        db = self._config.get_cache_path(cache_dir)
+        if not db.exists():
+            raise IndexNotFoundError(f"No Symdex index found at {db}.")
+        engine = self._get_engine(cache_dir)
+        return engine.get_callees(function_name, file_path=file_path, context_lines=context_lines)
+
+    def trace_call_chain(
+        self,
+        function_name: str,
+        *,
+        path: str | Path = ".",
+        direction: str = "callers",
+        max_depth: int = 5,
+        context_lines: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Trace the call chain from a function, walking up or down.
+
+        Args:
+            function_name: Starting function name.
+            path: Root directory whose ``.symdex/`` index to search.
+            direction: ``'callers'`` (up) or ``'callees'`` (down).
+            max_depth: Maximum recursion depth.
+            context_lines: Lines of code context per node.
+
+        Returns:
+            List of dicts, each with function info and a ``depth`` field.
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
+        """
+        cache_dir = Path(path).resolve() / self._config.symdex_dir
+        db = self._config.get_cache_path(cache_dir)
+        if not db.exists():
+            raise IndexNotFoundError(f"No Symdex index found at {db}.")
+        engine = self._get_engine(cache_dir)
+        return engine.trace_call_chain(
+            function_name, direction=direction,
+            max_depth=max_depth, context_lines=context_lines,
+        )
+
     # ── Async variants ────────────────────────────────────────────
     # These use asyncio.to_thread() to run sync operations off the
     # event loop. They raise the same exceptions as the sync methods
@@ -292,6 +384,37 @@ class Symdex:
     async def astats(self, path: str | Path = ".") -> Dict[str, int]:
         """Async variant of :meth:`stats`. Raises same exceptions as sync."""
         return await asyncio.to_thread(self.stats, path)
+
+    async def aget_callers(
+        self, function_name: str, *, path: str | Path = ".",
+        context_lines: int = 3,
+    ) -> List[SearchResult]:
+        """Async variant of :meth:`get_callers`."""
+        return await asyncio.to_thread(
+            self.get_callers, function_name, path=path, context_lines=context_lines,
+        )
+
+    async def aget_callees(
+        self, function_name: str, *, path: str | Path = ".",
+        file_path: str | None = None, context_lines: int = 3,
+    ) -> List[SearchResult]:
+        """Async variant of :meth:`get_callees`."""
+        return await asyncio.to_thread(
+            self.get_callees, function_name, path=path,
+            file_path=file_path, context_lines=context_lines,
+        )
+
+    async def atrace_call_chain(
+        self, function_name: str, *, path: str | Path = ".",
+        direction: str = "callers", max_depth: int = 5,
+        context_lines: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Async variant of :meth:`trace_call_chain`."""
+        return await asyncio.to_thread(
+            self.trace_call_chain, function_name, path=path,
+            direction=direction, max_depth=max_depth,
+            context_lines=context_lines,
+        )
 
     # ── Health (for agents / status endpoints) ─────────────────────
 

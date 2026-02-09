@@ -149,6 +149,17 @@ When a tool param is **not** sent by the client, the server uses **SymdexConfig*
 
 No search-default overrides; other options (e.g. `path`, `force`) are fixed defaults.
 
+### get_callers / get_callees / trace_call_chain (call graph)
+
+| Param | Config field | Default | Env override |
+|-------|----------------|---------|----------------|
+| `function_name` | — | (required) | — |
+| `path` | — | `"."` | — |
+| `context_lines` | `default_context_lines` | `3` | `SYMDEX_DEFAULT_CONTEXT_LINES` |
+| `file_path` (get_callees only) | — | `None` | — |
+| `direction` (trace_call_chain only) | — | `"callers"` | — |
+| `max_depth` (trace_call_chain only) | — | `5` | — |
+
 ---
 
 ## 5. How to configure MCP with default values

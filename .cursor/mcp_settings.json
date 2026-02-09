@@ -1,8 +1,8 @@
 {
-    "mcpServers": {
-      "symdex": {
-        "command": "symdex",
-        "args": ["mcp"]
-      }
+  "mcpServers": {
+    "symdex": {
+      "command": "symdex",
+      "args": ["mcp"]
     }
   }
+}

@@ -511,6 +511,154 @@ class CypherSearchEngine:
             logger.warning(f"Could not extract context from {file_path}: {e}")
             return "[Context unavailable]"
     
+    # ── Call Graph ────────────────────────────────────────────────
+
+    def get_callers(self, function_name: str, context_lines: int = 3) -> List[SearchResult]:
+        """Find indexed functions that call *function_name*.
+
+        Args:
+            function_name: Name of the target function.
+            context_lines: Lines of code context per result.
+
+        Returns:
+            List of :class:`SearchResult` objects for each caller, with context.
+        """
+        raw_results = self.cache.get_callers(function_name)
+        return self._process_call_graph_results(raw_results, context_lines)
+
+    def get_callees(self, function_name: str, file_path: str | None = None,
+                    context_lines: int = 3) -> List[SearchResult]:
+        """Find indexed functions called by *function_name*.
+
+        Args:
+            function_name: Name of the caller function.
+            file_path: Optional source file path to disambiguate when the
+                function name exists in multiple files.
+            context_lines: Lines of code context per result.
+
+        Returns:
+            List of :class:`SearchResult` objects for each callee, with context.
+        """
+        raw_results = self.cache.get_callees(function_name, caller_file=file_path)
+        return self._process_call_graph_results(raw_results, context_lines)
+
+    def trace_call_chain(self, function_name: str, direction: str = "callers",
+                         max_depth: int = 5, context_lines: int = 3) -> List[Dict[str, Any]]:
+        """Walk the call graph recursively from a starting function.
+
+        Args:
+            function_name: Starting function name.
+            direction: ``'callers'`` (who calls this — walk up) or
+                ``'callees'`` (what this calls — walk down).
+            max_depth: Maximum recursion depth (default 5).
+            context_lines: Lines of code context per node.
+
+        Returns:
+            Flat list of dicts, each with function info and a ``depth`` field.
+            Ordered by discovery (nearest first). Cycles are detected and
+            will not cause infinite recursion.
+        """
+        visited: set = set()
+        chain: List[Dict[str, Any]] = []
+
+        self._walk_call_graph(
+            function_name, direction, 1, max_depth,
+            visited, chain, context_lines,
+        )
+
+        return chain
+
+    def _walk_call_graph(self, function_name: str, direction: str,
+                         current_depth: int, max_depth: int,
+                         visited: set, chain: List[Dict[str, Any]],
+                         context_lines: int) -> None:
+        """Recursive DFS helper for :meth:`trace_call_chain`."""
+        if current_depth > max_depth:
+            return
+
+        if direction == "callers":
+            raw = self.cache.get_callers(function_name)
+        else:
+            raw = self.cache.get_callees(function_name)
+
+        for row in raw:
+            fname = row.get("function_name", "")
+            fpath = row.get("file_path", "")
+            key = (fpath, fname)
+            if key in visited:
+                continue
+            visited.add(key)
+
+            # Build a SearchResult with context
+            results = self._process_call_graph_results([row], context_lines)
+            if results:
+                r = results[0]
+                chain.append({
+                    "function_name": r.function_name,
+                    "file_path": r.file_path,
+                    "line_start": r.line_start,
+                    "line_end": r.line_end,
+                    "cypher": r.cypher,
+                    "depth": current_depth,
+                    "context": r.context,
+                    "path_root": r.path_root,
+                })
+
+                # Recurse into next level
+                self._walk_call_graph(
+                    fname, direction, current_depth + 1, max_depth,
+                    visited, chain, context_lines,
+                )
+
+    def _process_call_graph_results(self, raw_results: List[Dict[str, Any]],
+                                     context_lines: int) -> List[SearchResult]:
+        """Convert raw call-graph DB rows to :class:`SearchResult` objects with context."""
+        search_results = []
+        file_cache: Dict[str, List[str]] = {}
+
+        for result in raw_results:
+            func_name = result.get("function_name", "")
+            file_path = result.get("file_path", "")
+            cypher = result.get("cypher", "")
+
+            if not file_path or not func_name:
+                continue
+
+            path_root = str(self._cache_dir.parent) if self._cache_dir else ""
+            resolved_path = self._resolve_file_path(
+                file_path, result.get("relative_path"), path_root,
+            )
+
+            line_start = result.get("line_start", 0)
+            line_end = result.get("line_end", 0)
+
+            context = ""
+            if line_start and line_end:
+                context = self._extract_context_with_signature(
+                    resolved_path, line_start, line_end,
+                    file_cache, context_lines,
+                )
+
+            module_path = self._derive_module_path(resolved_path)
+            is_test = cypher.startswith("TST:") or self._is_test_file(resolved_path)
+
+            search_results.append(SearchResult(
+                file_path=resolved_path,
+                function_name=func_name,
+                line_start=line_start or 0,
+                line_end=line_end or 0,
+                cypher=cypher,
+                score=0.0,  # Call-graph results are not scored by relevance
+                context=context,
+                path_root=path_root,
+                module_path=module_path,
+                is_test=is_test,
+            ))
+
+        return search_results
+
+    # ── Statistics ─────────────────────────────────────────────────
+
     def get_statistics(self) -> Dict[str, int]:
         """Get search index statistics."""
         return self.cache.get_stats()

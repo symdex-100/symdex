@@ -275,6 +275,15 @@ class IndexingPipeline:
                     relative_path=rel_path,
                 )
 
+                # Store call edges for the call graph (callee resolution happens at query time)
+                if func_meta.call_sites:
+                    self.cache.add_call_edges(
+                        caller_file=file_path,
+                        caller_name=func_meta.name,
+                        caller_line=func_meta.start_line,
+                        call_sites=func_meta.call_sites,
+                    )
+
             return True
 
         except Exception as e:

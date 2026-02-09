@@ -12,7 +12,7 @@ import logging
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 @dataclass
+class CallSite:
+    """A function call detected within a function body via AST analysis.
+
+    Stored at index time to build the call graph. Each instance represents
+    one call expression (e.g. ``encrypt_file_content(data)``).
+    """
+    callee_name: str
+    """Name of the called function (simple name or attribute name)."""
+    line: int
+    """Source line number where the call occurs."""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class FunctionMetadata:
     """Structured representation of a function in any supported language."""
     name: str
@@ -43,7 +59,9 @@ class FunctionMetadata:
     docstring: Optional[str]
     complexity: int  # Cyclomatic complexity approximation
     language: str = "Python"  # Human-readable language name
-    
+    call_sites: List[CallSite] = field(default_factory=list)
+    """Detailed call sites with line numbers (for call graph). Populated by AST analysis."""
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -225,14 +243,25 @@ class CodeAnalyzer:
 
         args = [arg.arg for arg in node.args.args]
 
-        calls = []
+        # Extract calls with line numbers for call graph
+        call_sites_list: List[CallSite] = []
+        calls_set: set = set()
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
+                callee_name = None
                 if isinstance(child.func, ast.Name):
-                    calls.append(child.func.id)
+                    callee_name = child.func.id
                 elif isinstance(child.func, ast.Attribute):
-                    calls.append(child.func.attr)
-        calls = list(set(calls))[:10]
+                    callee_name = child.func.attr
+                if callee_name:
+                    call_sites_list.append(CallSite(
+                        callee_name=callee_name,
+                        line=child.lineno,
+                    ))
+                    calls_set.add(callee_name)
+
+        # Backward-compatible calls list (deduped, max 10, used for tag generation)
+        calls = list(calls_set)[:10]
 
         imports: List[str] = []
         docstring = ast.get_docstring(node)
@@ -253,6 +282,7 @@ class CodeAnalyzer:
             docstring=docstring,
             complexity=complexity,
             language="Python",
+            call_sites=call_sites_list,
         )
 
     # ── Helpers ───────────────────────────────────────────────────
@@ -343,6 +373,21 @@ class CypherCache:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cypher ON cypher_index(cypher)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON cypher_index(file_path)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_function_name ON cypher_index(function_name)")
+
+        # Call graph: edges between caller and callee functions (built at index time)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS call_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller_file TEXT NOT NULL,
+                caller_name TEXT NOT NULL,
+                caller_line INTEGER NOT NULL,
+                callee_name TEXT NOT NULL,
+                call_line INTEGER,
+                FOREIGN KEY (caller_file) REFERENCES indexed_files (file_path) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_name, caller_file)")
         conn.commit()
 
     def get_file_hash(self, file_path: Path) -> str:
@@ -466,7 +511,7 @@ class CypherCache:
         return results
 
     def get_stats(self) -> Dict[str, int]:
-        """Get indexing statistics."""
+        """Get indexing statistics (files, functions, and call graph edges)."""
         conn = self._get_connection()
         cursor = conn.execute("SELECT COUNT(*) FROM indexed_files")
         file_count = cursor.fetchone()[0]
@@ -474,15 +519,106 @@ class CypherCache:
         cursor = conn.execute("SELECT COUNT(*) FROM cypher_index")
         function_count = cursor.fetchone()[0]
 
+        cursor = conn.execute("SELECT COUNT(*) FROM call_edges")
+        edge_count = cursor.fetchone()[0]
+
         return {
             "indexed_files": file_count,
             "indexed_functions": function_count,
+            "call_edges": edge_count,
         }
 
+    # ── Call Graph ────────────────────────────────────────────────
+
+    def add_call_edges(self, caller_file: Path, caller_name: str,
+                       caller_line: int, call_sites: List) -> None:
+        """Store call edges extracted from a function's AST.
+
+        Each element in *call_sites* must expose ``callee_name`` and ``line``
+        (either as attributes or dict keys).  Duplicate edges (same
+        caller → callee within one function) are deduplicated before insert.
+        """
+        if not call_sites:
+            return
+        conn = self._get_connection()
+        seen: set = set()
+        for site in call_sites:
+            callee = site.callee_name if hasattr(site, "callee_name") else site["callee_name"]
+            line = site.line if hasattr(site, "line") else site.get("line")
+            key = (caller_name, callee)
+            if key in seen:
+                continue
+            seen.add(key)
+            conn.execute("""
+                INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_line)
+                VALUES (?, ?, ?, ?, ?)
+            """, (str(caller_file), caller_name, caller_line, callee, line))
+        conn.commit()
+
+    def get_callers(self, function_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Find indexed functions that call *function_name*.
+
+        Joins ``call_edges`` (callee side) with ``cypher_index`` to return
+        full metadata for each caller.  Only callers that are themselves
+        indexed appear in the results.
+        """
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("""
+            SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                   ci.cypher, ci.tags, ci.signature, ci.relative_path
+            FROM call_edges ce
+            JOIN cypher_index ci
+              ON ci.file_path = ce.caller_file AND ci.function_name = ce.caller_name
+            WHERE ce.callee_name = ?
+            ORDER BY ci.file_path, ci.line_start
+            LIMIT ?
+        """, (function_name, limit))
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return results
+
+    def get_callees(self, function_name: str, caller_file: str | None = None,
+                    limit: int = 50) -> List[Dict[str, Any]]:
+        """Find indexed functions called by *function_name*.
+
+        When *caller_file* is provided, restricts to edges originating
+        from that file (useful when the function name is ambiguous).
+        Only callees that are themselves indexed are returned.
+        """
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        if caller_file:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci ON ci.function_name = ce.callee_name
+                WHERE ce.caller_name = ? AND ce.caller_file = ?
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, caller_file, limit))
+        else:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci ON ci.function_name = ce.callee_name
+                WHERE ce.caller_name = ?
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, limit))
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return results
+
+    # ── Cleanup ────────────────────────────────────────────────────
+
     def clear_file_entries(self, file_path: Path):
-        """Remove all entries for a specific file."""
+        """Remove all entries for a specific file (cypher index + call edges)."""
         conn = self._get_connection()
         conn.execute("DELETE FROM cypher_index WHERE file_path = ?", (str(file_path),))
+        conn.execute("DELETE FROM call_edges WHERE caller_file = ?", (str(file_path),))
         conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (str(file_path),))
         conn.commit()
 

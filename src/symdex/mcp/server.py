@@ -283,7 +283,7 @@ def create_server(config: SymdexConfig | None = None):
         """
         return json.dumps({
             "status": "ok",
-            "version": "1.1.1",
+            "version": "1.2.0",
             "provider": cfg.llm_provider,
             "model": cfg.get_model(),
         })
@@ -377,12 +377,152 @@ def create_server(config: SymdexConfig | None = None):
             "5. Read: Open the top result's file at the specific line\n"
         )
 
+    # ==================================================================
+    # Tool: get_callers (call graph)
+    # ==================================================================
+
+    @mcp.tool()
+    def get_callers(
+        function_name: Annotated[
+            str,
+            Field(description="Name of the function to find callers for (e.g., 'encrypt_file_content'). Searches the call graph built during indexing.")
+        ],
+        path: Annotated[
+            str,
+            Field(default=".", description="Root directory path whose Symdex index to search. Defaults to current working directory ('.').")
+        ] = ".",
+        context_lines: Annotated[
+            int | None,
+            Field(default=None, description="Number of lines of code context to include per result. Default uses config (typically 3).")
+        ] = None,
+    ) -> str:
+        """Find all indexed functions that call the specified function.
+
+        Use this to answer **"who calls X?"** — e.g., to trace which
+        functions invoke ``encrypt_file_content``, or to understand where
+        a utility is used across the codebase.
+
+        Requires the codebase to have been indexed (call edges are
+        extracted during ``index_directory``).
+
+        Returns:
+            JSON array of caller functions with file, line, cypher, and context.
+        """
+        from symdex.core.search import CypherSearchEngine, ResultFormatter
+
+        ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        cache_dir = _resolve_cache(path)
+        engine = CypherSearchEngine(cache_dir, config=cfg)
+        results = engine.get_callers(function_name, context_lines=ctx_lines)
+        return ResultFormatter.format_json(results)
+
+    # ==================================================================
+    # Tool: get_callees (call graph)
+    # ==================================================================
+
+    @mcp.tool()
+    def get_callees(
+        function_name: Annotated[
+            str,
+            Field(description="Name of the function to find callees for (e.g., 'process_files'). Searches the call graph built during indexing.")
+        ],
+        path: Annotated[
+            str,
+            Field(default=".", description="Root directory path whose Symdex index to search. Defaults to current working directory ('.').")
+        ] = ".",
+        file_path: Annotated[
+            str | None,
+            Field(default=None, description="Optional source file path to disambiguate when the function name exists in multiple files.")
+        ] = None,
+        context_lines: Annotated[
+            int | None,
+            Field(default=None, description="Number of lines of code context to include per result. Default uses config (typically 3).")
+        ] = None,
+    ) -> str:
+        """Find all indexed functions called by the specified function.
+
+        Use this to answer **"what does X call?"** — e.g., to trace the
+        execution flow from ``process_files`` down to its dependencies.
+
+        Only returns callees that are themselves indexed (external/built-in
+        calls like ``print`` or ``len`` are excluded).
+
+        Returns:
+            JSON array of callee functions with file, line, cypher, and context.
+        """
+        from symdex.core.search import CypherSearchEngine, ResultFormatter
+
+        ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        cache_dir = _resolve_cache(path)
+        engine = CypherSearchEngine(cache_dir, config=cfg)
+        results = engine.get_callees(function_name, file_path=file_path, context_lines=ctx_lines)
+        return ResultFormatter.format_json(results)
+
+    # ==================================================================
+    # Tool: trace_call_chain (recursive call graph walk)
+    # ==================================================================
+
+    @mcp.tool()
+    def trace_call_chain(
+        function_name: Annotated[
+            str,
+            Field(description="Starting function name for the trace (e.g., 'encrypt_file_content').")
+        ],
+        path: Annotated[
+            str,
+            Field(default=".", description="Root directory path whose Symdex index to search.")
+        ] = ".",
+        direction: Annotated[
+            str,
+            Field(default="callers", description="Direction to trace: 'callers' (who calls this, walking up) or 'callees' (what this calls, walking down).")
+        ] = "callers",
+        max_depth: Annotated[
+            int,
+            Field(default=5, description="Maximum depth to trace (default 5). Higher values trace further but may return more results.")
+        ] = 5,
+        context_lines: Annotated[
+            int | None,
+            Field(default=None, description="Lines of code context per result.")
+        ] = None,
+    ) -> str:
+        """Trace the call chain from a function, walking up (callers) or down (callees).
+
+        This **recursively** follows the call graph to show the full execution flow.
+        For example, tracing callers of ``encrypt_file_content`` might reveal::
+
+            depth 1: encrypt_file_in_place   (calls encrypt_file_content)
+            depth 2: process_files_batch     (calls encrypt_file_in_place)
+            depth 3: process_files           (calls process_files_batch)
+
+        Cycles are detected automatically and will not cause infinite recursion.
+
+        Returns:
+            JSON object with ``root``, ``direction``, ``max_depth``, and a
+            ``chain`` array of nodes ordered by depth (nearest first).
+        """
+        from symdex.core.search import CypherSearchEngine
+
+        ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        cache_dir = _resolve_cache(path)
+        engine = CypherSearchEngine(cache_dir, config=cfg)
+        chain = engine.trace_call_chain(
+            function_name, direction=direction,
+            max_depth=max_depth, context_lines=ctx_lines,
+        )
+
+        return json.dumps({
+            "root": function_name,
+            "direction": direction,
+            "max_depth": max_depth,
+            "chain": chain,
+        }, indent=2)
+
     return mcp
 
 
 # Server card JSON for Smithery scanning (https://smithery.ai/docs/build/external#server-scanning)
 SERVER_CARD = {
-    "serverInfo": {"name": "Symdex-100", "version": "1.1.1"},
+    "serverInfo": {"name": "Symdex-100", "version": "1.2.0"},
     "authentication": {"required": False, "schemes": []},
     "tools": [
         {"name": "search_codebase", "description": "Search the Symdex index by natural-language or Cypher pattern.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
@@ -390,6 +530,9 @@ SERVER_CARD = {
         {"name": "index_directory", "description": "Index source files into .symdex/ sidecar.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}}}},
         {"name": "get_index_stats", "description": "Return index statistics for a directory.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
         {"name": "health", "description": "Server readiness check.", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "get_callers", "description": "Find functions that call a given function (call graph).", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
+        {"name": "get_callees", "description": "Find functions called by a given function (call graph).", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "file_path": {"type": "string"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
+        {"name": "trace_call_chain", "description": "Recursively trace the call chain (callers or callees) from a function.", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "direction": {"type": "string"}, "max_depth": {"type": "integer"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
     ],
     "resources": [
         {"uri": "symdex://schema/domains", "description": "Cypher domain codes"},

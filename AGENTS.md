@@ -52,6 +52,10 @@ token, async pattern."
 5. **You'd otherwise read 3+ files** — If your task requires reading
    multiple files to find the right function, use Symdex first.
 
+6. **You need to trace execution flow** — Use `get_callers` ("who calls X?"),
+   `get_callees` ("what does X call?"), or `trace_call_chain` to walk the
+   call graph without manually reading files or grepping.
+
 ### DO NOT use Symdex when:
 
 1. **You already know the exact file and line** — just read it directly.
@@ -126,8 +130,32 @@ shows 0 indexed files.
 
 ### `get_index_stats(path=".")`
 
-Returns `{indexed_files, indexed_functions}`.  Use to check if indexing
-has been done.
+Returns `{indexed_files, indexed_functions, call_edges}`.  Use to check if
+indexing has been done.  `call_edges` is the number of caller→callee
+relationships (built at index time) used by the call-graph tools.
+
+### `get_callers(function_name, path=".", context_lines=None)`
+
+Find **who calls** a given function.  Use to answer "where is X invoked?"
+Requires the codebase to have been indexed (call edges are extracted during
+`index_directory`).  Returns a JSON array of caller functions with file,
+line, cypher, and code context.
+
+### `get_callees(function_name, path=".", file_path=None, context_lines=None)`
+
+Find **what** a given function **calls** (only indexed callees).  Use to
+trace execution flow downward.  Pass `file_path` to disambiguate when the
+function name exists in multiple files.  Returns a JSON array of callee
+functions with file, line, cypher, and context.
+
+### `trace_call_chain(function_name, path=".", direction="callers", max_depth=5, context_lines=None)`
+
+Recursively trace the call graph from a function.  **direction**: `"callers"`
+(walk up: who calls this, who calls them, …) or `"callees"` (walk down: what
+this calls, what they call, …).  **max_depth** limits recursion; cycles are
+detected and will not cause infinite loops.  Returns JSON with `root`,
+`direction`, `max_depth`, and a `chain` array of nodes (each with `depth`,
+`function_name`, `file_path`, `line_start`, `cypher`, `context`).
 
 ### `health()`
 
@@ -197,12 +225,18 @@ hits = client.search("validate user tokens", path="./project", explain=True)
 print(hits[0].explanation)
 # {'action_match': 6.0, 'object_match': 5.0, 'name_matches': {'exact': 1, 'score': 3.0}}
 
-# Get stats
+# Get stats (includes indexed_files, indexed_functions, call_edges)
 stats = client.stats("./project")
+
+# Call graph: who calls X? what does X call? trace chain
+callers = client.get_callers("encrypt_file_content", path="./project")
+callees = client.get_callees("process_files", path="./project")
+chain = client.trace_call_chain("add_cypher_entry", direction="callers", max_depth=4, path="./project")
 ```
 
 Async variants are available: `client.aindex()`, `client.asearch()`,
-`client.astats()`.
+`client.astats()`, `client.aget_callers()`, `client.aget_callees()`,
+`client.atrace_call_chain()`.
 
 ---
 
@@ -227,7 +261,11 @@ Async variants are available: `client.aindex()`, `client.asearch()`,
              → You now have precise context, not a haystack
              → OR if context_lines was high enough, edit directly from search result
 
-6. Act:     Make your edit / answer the question / generate the code
+6. Call flow (optional):  get_callers("function_name") or get_callees("function_name")
+             → Or trace_call_chain("function_name", direction="callers", max_depth=5)
+             → Use when you need to see who calls X or what X calls, without manual grep
+
+7. Act:     Make your edit / answer the question / generate the code
 ```
 
 **Key insight:** Start with `context_lines=3` for exploration (cheap, fast). Once you've identified the right function, either:

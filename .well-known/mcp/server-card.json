@@ -1,7 +1,7 @@
 {
   "serverInfo": {
     "name": "Symdex-100",
-    "version": "1.1.1"
+    "version": "1.2.0"
   },
   "authentication": {
     "required": false,
@@ -46,12 +46,54 @@
     },
     {
       "name": "get_index_stats",
-      "description": "Return statistics about the Symdex index for a directory.",
+      "description": "Return statistics about the Symdex index for a directory (indexed_files, indexed_functions, call_edges).",
       "inputSchema": {
         "type": "object",
         "properties": {
           "path": { "type": "string", "default": "." }
         }
+      }
+    },
+    {
+      "name": "get_callers",
+      "description": "Find functions that call the given function (call graph). Use to answer 'who calls X?'. Requires index with call edges from index_directory.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "function_name": { "type": "string", "description": "Name of the function to find callers for" },
+          "path": { "type": "string", "default": "." },
+          "context_lines": { "type": "integer", "description": "Lines of code context per result" }
+        },
+        "required": [ "function_name" ]
+      }
+    },
+    {
+      "name": "get_callees",
+      "description": "Find functions called by the given function (call graph). Use to answer 'what does X call?'. Only returns indexed callees.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "function_name": { "type": "string", "description": "Name of the function to find callees for" },
+          "path": { "type": "string", "default": "." },
+          "file_path": { "type": "string", "description": "Optional source file to disambiguate when function exists in multiple files" },
+          "context_lines": { "type": "integer" }
+        },
+        "required": [ "function_name" ]
+      }
+    },
+    {
+      "name": "trace_call_chain",
+      "description": "Recursively trace the call graph from a function: direction 'callers' (who calls this, walk up) or 'callees' (what this calls, walk down). Cycles are detected.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "function_name": { "type": "string", "description": "Starting function name" },
+          "path": { "type": "string", "default": "." },
+          "direction": { "type": "string", "default": "callers", "enum": [ "callers", "callees" ] },
+          "max_depth": { "type": "integer", "default": 5 },
+          "context_lines": { "type": "integer" }
+        },
+        "required": [ "function_name" ]
       }
     },
     {
