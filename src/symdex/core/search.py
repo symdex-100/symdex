@@ -90,7 +90,8 @@ class CypherSearchEngine:
     # ── Public API ────────────────────────────────────────────────
 
     def search(self, query: str, strategy: str = "auto",
-               max_results: int = None) -> List[SearchResult]:
+               max_results: int = None, context_lines: int = 3,
+               explain: bool = False, exclude_tests: bool = True) -> List[SearchResult]:
         """
         Execute a search query using the specified strategy.
 
@@ -98,6 +99,9 @@ class CypherSearchEngine:
             query: Natural language search query or Cypher pattern.
             strategy: Search strategy ('auto', 'llm', 'keyword', 'direct').
             max_results: Maximum number of results to return.
+            context_lines: Lines of code context per result (default 3; increase for editing).
+            explain: Include scoring breakdown in results (for debugging).
+            exclude_tests: If True, filter out test functions (default True for normal use).
 
         Returns:
             Ranked list of search results.
@@ -132,7 +136,12 @@ class CypherSearchEngine:
             )
 
         # Score against the tight (primary) pattern so precise matches rank highest
-        search_results = self._process_results(raw_results, primary_pattern, query)
+        search_results = self._process_results(raw_results, primary_pattern, query, context_lines, explain)
+        
+        # Filter tests if requested
+        if exclude_tests:
+            search_results = [r for r in search_results if not r.is_test]
+        
         search_results.sort()
         self._last_db_elapsed_seconds = time.perf_counter() - t0
         return search_results[:max_results]
@@ -142,7 +151,7 @@ class CypherSearchEngine:
         max_results = max_results or self._config.max_search_results
         t0 = time.perf_counter()
         raw_results = self.cache.search_by_tags(tag, limit=max_results)
-        search_results = self._process_results(raw_results, None, tag)
+        search_results = self._process_results(raw_results, None, tag, context_lines=3)
         self._last_db_elapsed_seconds = time.perf_counter() - t0
         return search_results
 
@@ -317,7 +326,8 @@ class CypherSearchEngine:
         return merged
     
     def _process_results(self, raw_results: List[Dict[str, Any]], 
-                        cypher_pattern: Optional[str], query: str) -> List[SearchResult]:
+                        cypher_pattern: Optional[str], query: str,
+                        context_lines: int = 3, explain: bool = False) -> List[SearchResult]:
         """Convert raw database results to SearchResult objects with scoring."""
         search_results = []
         
@@ -329,38 +339,151 @@ class CypherSearchEngine:
             # Extract tags
             tags = result.get('tags', '').split(',') if result.get('tags') else []
             func_name = result.get('function_name', '')
+            file_path = result['file_path']
+            cypher = result['cypher']
             
             # Calculate score
+            explanation_dict = None
             if cypher_pattern:
-                score = calculate_search_score(
-                    cypher_pattern, result['cypher'], tags, query,
+                score_result = calculate_search_score(
+                    cypher_pattern, cypher, tags, query,
                     function_name=func_name,
                     config=self._config,
+                    explain=explain,
                 )
+                if explain:
+                    score, explanation_dict = score_result
+                else:
+                    score = score_result
             else:
                 score = 1.0  # Base score for tag searches
+
+            path_root = str(self._cache_dir.parent) if self._cache_dir else ""
+            # Resolve path for portability: use path_root + relative_path when stored path missing (e.g. index from Docker, search on Windows)
+            resolved_path = self._resolve_file_path(file_path, result.get("relative_path"), path_root)
             
-            # Extract context (with file caching)
-            context = self._extract_context_cached(
-                result['file_path'],
+            # Extract context using resolved path so we read from the correct location
+            context = self._extract_context_with_signature(
+                resolved_path,
                 result['line_start'],
                 result['line_end'],
-                file_cache
+                file_cache,
+                context_lines
             )
             
-            path_root = str(self._cache_dir.parent) if self._cache_dir else ""
+            # Derive module path from resolved path
+            module_path = self._derive_module_path(resolved_path)
+            # Detect if this is a test function
+            is_test = cypher.startswith('TST:') or self._is_test_file(resolved_path)
+
             search_results.append(SearchResult(
-                file_path=result['file_path'],
+                file_path=resolved_path,
                 function_name=func_name,
                 line_start=result['line_start'],
                 line_end=result['line_end'],
-                cypher=result['cypher'],
+                cypher=cypher,
                 score=score,
                 context=context,
                 path_root=path_root,
+                explanation=explanation_dict,
+                module_path=module_path,
+                is_test=is_test,
             ))
         
         return search_results
+    
+    def _resolve_file_path(self, stored_path: str, relative_path: str | None, path_root: str) -> str:
+        """Resolve to a path that exists: use path_root + relative_path when stored path is missing (e.g. index in Docker, search on Windows)."""
+        p = Path(stored_path)
+        if p.exists():
+            return str(p.resolve())
+        if path_root and relative_path:
+            resolved = Path(path_root) / relative_path
+            if resolved.exists():
+                return str(resolved.resolve())
+        return stored_path
+
+    def _extract_context_with_signature(self, file_path: str, start_line: int, 
+                                        end_line: int, file_cache: Dict[str, List[str]], 
+                                        context_lines: int = 3) -> str:
+        """
+        Extract code context including full function signature + body preview.
+        
+        IMPROVEMENT (v1.2): Always includes full function signature, even if multi-line.
+        """
+        try:
+            # Check cache first
+            if file_path not in file_cache:
+                path = Path(file_path)
+                if not path.exists():
+                    return "[File not found]"
+                file_cache[file_path] = path.read_text(encoding='utf-8').splitlines()
+            
+            lines = file_cache[file_path]
+            function_length = end_line - start_line + 1
+            
+            # Auto-adjust for small functions
+            if function_length <= context_lines * 2:
+                # Function is small, return full function
+                func_lines = lines[start_line - 1:end_line]
+                return "\n".join(func_lines)
+            
+            # For larger functions: full signature + context_lines of body + extra (docstring/first statement)
+            # Find end of signature (line with '):' or ':' at the end)
+            signature_end = start_line
+            for i in range(start_line - 1, min(start_line + 5, end_line)):
+                line = lines[i].rstrip()
+                if line.endswith(':') or line.endswith('):'):
+                    signature_end = i + 1
+                    break
+            
+            # Add 2 extra lines so first line of docstring or first insert/match often appears (improves quick confirmation)
+            extra_lines = 2
+            end_preview = min(signature_end + context_lines + extra_lines, end_line)
+            func_lines = lines[start_line - 1:end_preview]
+            return "\n".join(func_lines)
+        except Exception as e:
+            logger.warning(f"Could not extract context from {file_path}: {e}")
+            return "[Context unavailable]"
+    
+    def _derive_module_path(self, file_path: str) -> str:
+        """Derive Python module path from file path (e.g., 'auth.tokens')."""
+        try:
+            path = Path(file_path)
+            # Find the root (look for common project indicators)
+            parts = list(path.parts)
+            
+            # Try to find src/ or project root
+            for i, part in enumerate(parts):
+                if part in ('src', 'lib', 'app'):
+                    parts = parts[i+1:]
+                    break
+            
+            # Convert to module path
+            if path.stem == '__init__':
+                # __init__.py → parent package name
+                module_parts = parts[:-1]
+            else:
+                # file.py → file
+                module_parts = parts[:-1] + [path.stem]
+            
+            return '.'.join(module_parts) if module_parts else ""
+        except Exception:
+            return ""
+    
+    def _is_test_file(self, file_path: str) -> bool:
+        """Check if file is a test file based on path patterns."""
+        path_lower = file_path.lower()
+        return any([
+            '/test/' in path_lower,
+            '/tests/' in path_lower,
+            '\\test\\' in path_lower,
+            '\\tests\\' in path_lower,
+            path_lower.endswith('_test.py'),
+            path_lower.endswith('test_.py'),
+            path_lower.startswith('test_'),
+            'conftest.py' in path_lower,
+        ])
     
     def _extract_context_cached(self, file_path: str, start_line: int, 
                                 end_line: int, file_cache: Dict[str, List[str]], 
@@ -469,6 +592,20 @@ class ResultFormatter:
             out.append(f"    Lines  : {r.line_start}–{r.line_end}")
             out.append(f"    Cypher : {r.cypher}")
             out.append(f"    Score  : {r.score:.1f}")
+            
+            # Show scoring explanation if available
+            if r.explanation:
+                parts = []
+                if 'action_match' in r.explanation:
+                    parts.append(f"action(+{r.explanation['action_match']:.0f})")
+                if 'object_match' in r.explanation:
+                    parts.append(f"object(+{r.explanation['object_match']:.0f})")
+                if 'domain_match' in r.explanation:
+                    parts.append(f"domain(+{r.explanation['domain_match']:.0f})")
+                if 'name_matches' in r.explanation:
+                    parts.append(f"name(+{r.explanation['name_matches']['score']:.1f})")
+                if parts:
+                    out.append(f"    Explain: {' '.join(parts)}")
 
             if show_context and r.context:
                 out.append("")

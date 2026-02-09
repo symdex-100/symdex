@@ -206,6 +206,16 @@ class TestCypherCache:
         results = cache.search_by_cypher("DAT:%_DATA--SYN")
         assert len(results) == 2
 
+    def test_search_by_cypher_matches_compound_obj(self, cache, sample_file):
+        """Single-OBJ pattern should also return rows with compound OBJ (e.g. RELATIONSHIPS+AUDIT)."""
+        cache.add_cypher_entry(
+            sample_file, "create_audit_entity_and_relations", 1, 10,
+            "DAT:CRT_RELATIONSHIPS+AUDIT--SYN", ["audit", "relations"], "→ bool", "O(1)"
+        )
+        results = cache.search_by_cypher("DAT:CRT_RELATIONSHIPS--SYN")
+        assert len(results) == 1
+        assert results[0]["cypher"] == "DAT:CRT_RELATIONSHIPS+AUDIT--SYN"
+
     def test_search_by_tags(self, cache, sample_file):
         cache.add_cypher_entry(
             sample_file, "foo", 1, 3, "SEC:VAL_TOKEN--SYN",
@@ -264,6 +274,9 @@ class TestCypherGeneratorValidation:
         ("sec:val_token--syn", False),
         # Invalid: no double-dash
         ("SEC:VAL_TOKEN-SYN", False),
+        # Valid: compound OBJ (primary+secondary)
+        ("DAT:CRT_RELATIONSHIPS+AUDIT--SYN", True),
+        ("DAT:AGG_DATASET+EXPERTISE--SYN", True),
     ])
     def test_validate_cypher(self, cypher, valid):
         assert CypherGenerator._validate_cypher(cypher) == valid

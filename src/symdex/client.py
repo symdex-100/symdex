@@ -147,6 +147,8 @@ class Symdex:
         strategy: str = "auto",
         max_results: int | None = None,
         min_score: float | None = None,
+        context_lines: int = 3,
+        exclude_tests: bool | None = None,
     ) -> List[SearchResult]:
         """
         Search the Symdex index for functions matching *query*.
@@ -157,6 +159,8 @@ class Symdex:
             strategy: ``'auto'`` | ``'llm'`` | ``'keyword'`` | ``'direct'``.
             max_results: Maximum hits to return.
             min_score: Minimum relevance score threshold.
+            context_lines: Lines of code context per result (default 3).
+            exclude_tests: If True, filter out test functions. Default None uses config (True = exclude by default).
 
         Returns:
             Ranked list of :class:`SearchResult` objects. Each result has
@@ -175,7 +179,8 @@ class Symdex:
             )
 
         engine = self._get_engine(cache_dir)
-        results = engine.search(query, strategy=strategy, max_results=max_results)
+        no_tests = exclude_tests if exclude_tests is not None else self._config.default_exclude_tests
+        results = engine.search(query, strategy=strategy, max_results=max_results, context_lines=context_lines, exclude_tests=no_tests)
 
         score_threshold = min_score if min_score is not None else self._config.min_search_score
         return [r for r in results if r.score >= score_threshold]

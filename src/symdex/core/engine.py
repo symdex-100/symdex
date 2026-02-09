@@ -110,6 +110,12 @@ class SearchResult:
     context: str = ""
     path_root: str = ""
     """Index root directory (e.g. project path). Empty if not provided."""
+    explanation: dict | None = None
+    """Optional scoring breakdown for debugging (when explain=True)."""
+    module_path: str = ""
+    """Python module path (e.g., 'auth.tokens'). Empty if not derivable."""
+    is_test: bool = False
+    """True if this function is in a test file or has TST domain."""
 
     def __lt__(self, other):
         return self.score > other.score  # Higher score = better
@@ -135,6 +141,8 @@ class IndexResult:
     errors: int = 0
     root_dir: str = ""
     index_dir: str = ""
+    summary: dict | None = None
+    """Optional summary with top files and domains (added post-indexing)."""
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict for API/agent pipelines."""
@@ -326,6 +334,7 @@ class CypherCache:
                 signature TEXT,
                 complexity TEXT,
                 indexed_at TIMESTAMP NOT NULL,
+                relative_path TEXT,
                 FOREIGN KEY (file_path) REFERENCES indexed_files (file_path) ON DELETE CASCADE
             )
         """)
@@ -365,32 +374,53 @@ class CypherCache:
 
     def add_cypher_entry(self, file_path: Path, function_name: str, line_start: int,
                          line_end: int, cypher: str, tags: List[str],
-                         signature: str, complexity: str):
-        """Add a Cypher entry to the index."""
+                         signature: str, complexity: str, relative_path: str | None = None):
+        """Add a Cypher entry to the index. relative_path is path relative to project root (portable across machines)."""
         conn = self._get_connection()
         now_iso = datetime.now().isoformat()
         conn.execute("""
             INSERT INTO cypher_index
-            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at, relative_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(file_path), function_name, line_start, line_end, cypher,
-              ",".join(tags), signature, complexity, now_iso))
+              ",".join(tags), signature, complexity, now_iso, relative_path))
         conn.commit()
 
     def search_by_cypher(self, pattern: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search for functions matching a Cypher pattern (supports wildcards)."""
+        """Search for functions matching a Cypher pattern (supports wildcards). Also matches compound OBJ (e.g. RELATIONSHIPS+AUDIT when pattern has RELATIONSHIPS)."""
         sql_pattern = pattern.replace("*", "%")
+        # When pattern has no wildcard in OBJ (e.g. DAT:CRT_RELATIONSHIPS--SYN), also match compound OBJ (RELATIONSHIPS+AUDIT)
+        patterns_to_try = [sql_pattern]
+        if "*" not in pattern and "--" in pattern:
+            # Parse DOM:ACT_OBJ--PAT and add variant ACT_OBJ% to match compound
+            parts = pattern.split(":", 1)
+            if len(parts) == 2 and "_" in parts[1] and "--" in parts[1]:
+                act_obj, pat = parts[1].split("--", 1)
+                if "+" not in act_obj and "%" not in act_obj:
+                    compound_pattern = f"{parts[0]}:{act_obj}%--{pat}".replace("*", "%")
+                    patterns_to_try.append(compound_pattern)
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute("""
-            SELECT file_path, function_name, line_start, line_end, cypher, tags, signature
-            FROM cypher_index
-            WHERE cypher LIKE ?
-            ORDER BY indexed_at DESC
-            LIMIT ?
-        """, (sql_pattern, limit))
-        results = [dict(row) for row in cursor.fetchall()]
-        conn.row_factory = None  # Reset for other queries
+        seen = set()
+        results = []
+        for p in patterns_to_try:
+            cursor = conn.execute("""
+                SELECT file_path, function_name, line_start, line_end, cypher, tags, signature, relative_path
+                FROM cypher_index
+                WHERE cypher LIKE ?
+                ORDER BY indexed_at DESC
+                LIMIT ?
+            """, (p, limit))
+            for row in cursor.fetchall():
+                key = (row["file_path"], row["function_name"], row["line_start"])
+                if key not in seen:
+                    seen.add(key)
+                    results.append(dict(row))
+                    if len(results) >= limit:
+                        break
+            if len(results) >= limit:
+                break
+        conn.row_factory = None
         return results
 
     def search_by_tags(self, tag: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -398,7 +428,7 @@ class CypherCache:
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.execute("""
-            SELECT file_path, function_name, line_start, line_end, cypher, tags
+            SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
             FROM cypher_index
             WHERE tags LIKE ?
             LIMIT ?
@@ -425,7 +455,7 @@ class CypherCache:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(f"""
             SELECT file_path, function_name, line_start, line_end,
-                   cypher, tags, signature
+                   cypher, tags, signature, relative_path
             FROM cypher_index
             WHERE {conditions}
             ORDER BY indexed_at DESC
@@ -681,6 +711,15 @@ class CypherGenerator:
         if getattr(cfg, "cypher_fallback_only", False):
             return self._generate_fallback_cypher(metadata)
 
+        # Fast-path: known boilerplate methods almost always get SKIP; avoid LLM call.
+        _BOILERPLATE_NAMES = frozenset({
+            "setUp", "tearDown", "setUpClass", "tearDownClass", "setUpModule", "tearDownModule",
+            "__init__", "__new__", "__enter__", "__exit__", "__repr__", "__str__",
+        })
+        if metadata.name in _BOILERPLATE_NAMES:
+            logger.debug(f"Skip LLM for boilerplate '{metadata.name}'")
+            return None
+
         for attempt in range(1, cfg.retry_attempts + 1):
             try:
                 cypher = self._ensure_llm().complete(
@@ -819,12 +858,14 @@ class CypherGenerator:
           PAT: 3 chars     (e.g. SYN, ASY, REC)
         
         With allow_wildcards=True each slot may also be a single '*'.
-        OBJ allows A–Z and 0–9 to support compact encodings like B64, K8OBJ, HTTPREQ.
+        OBJ allows A–Z and 0–9. Compound OBJ: up to 3 parts joined by + (e.g. RELATIONSHIPS+AUDIT).
         """
         # Slot patterns: exact code OR single wildcard '*'
         dom_p = r'(?:\*|[A-Z]{2,3})'      if allow_wildcards else r'[A-Z]{2,3}'
         act_p = r'(?:\*|[A-Z]{3})'        if allow_wildcards else r'[A-Z]{3}'
-        obj_p = r'(?:\*|[A-Z0-9]{2,20})'  if allow_wildcards else r'[A-Z0-9]{2,20}'
+        # OBJ: single token or compound (OBJ, OBJ+OBJ, or OBJ+OBJ+OBJ), each part 2-20 chars
+        obj_part = r'[A-Z0-9]{2,20}'
+        obj_p = r'(?:\*|' + obj_part + r'(?:\+' + obj_part + r'){0,2})' if allow_wildcards else (obj_part + r'(?:\+' + obj_part + r'){0,2}')
         pat_p = r'(?:\*|[A-Z]{3})'        if allow_wildcards else r'[A-Z]{3}'
         
         full_pattern = rf'^({dom_p}):({act_p})_({obj_p})--({pat_p})$'
@@ -843,17 +884,17 @@ class CypherGenerator:
     
     @staticmethod
     def _generate_fallback_cypher(metadata: FunctionMetadata) -> str:
-        """Generate a rule-based Cypher when LLM fails."""
-        # Determine domain and action from function name
+        """Generate a rule-based Cypher when LLM fails. Uses compound OBJ when name suggests multiple objects."""
         name_lower = metadata.name.lower()
+        name_segments = [s for s in name_lower.replace("-", "_").split("_") if len(s) > 1]
         
-        dom = "DAT"  # Default
+        dom = "DAT"
         for keyword, code in CypherSchema.KEYWORD_TO_DOMAIN.items():
             if keyword in name_lower:
                 dom = code
                 break
         
-        act = "TRN"  # Default
+        act = "TRN"
         for keyword, code in CypherSchema.KEYWORD_TO_ACTION.items():
             if keyword in name_lower:
                 act = code
@@ -861,12 +902,34 @@ class CypherGenerator:
         
         pat = "ASY" if metadata.is_async else "SYN"
         
-        # Extract object from function name (crude heuristic)
-        obj = "DATA"
-        name_parts = re.findall(r'[A-Z][a-z]+', metadata.name.replace('_', ' ').title())
-        if name_parts:
-            obj = "".join(name_parts[0][:4].upper()).ljust(4, 'X')
+        # Match name segments to COMMON_OBJECT_CODES for compound OBJ (max 3)
+        skip = {"and", "or", "the", "into", "from", "for", "with", "get", "set", "run", "do"}
+        obj_codes = []
+        seen = set()
+        for seg in name_segments:
+            if seg in skip:
+                continue
+            seg_upper = seg.upper()
+            for code in CypherSchema.COMMON_OBJECT_CODES:
+                code_lower = code.lower()
+                if code in seen:
+                    continue
+                if seg == code_lower or seg in code_lower or code_lower in seg:
+                    obj_codes.append(code)
+                    seen.add(code)
+                    break
+            if len(obj_codes) >= 3:
+                break
         
+        if obj_codes:
+            obj = "+".join(obj_codes[:3])
+        else:
+            # Fallback: first segment abbreviated
+            obj = "DATA"
+            if name_segments:
+                first = name_segments[0][:4].upper().ljust(4, "X")
+                if first.isalpha():
+                    obj = first
         return f"{dom}:{act}_{obj}--{pat}"
     
     @staticmethod
@@ -986,7 +1049,8 @@ def calculate_search_score(
     query: str,
     function_name: str = "",
     config: SymdexConfig | None = None,
-) -> float:
+    explain: bool = False,
+) -> float | tuple[float, dict]:
     """
     Calculate relevance score for a search result.
     
@@ -996,10 +1060,14 @@ def calculate_search_score(
       - Exact Cypher match bonus
       - Tag overlap with query words
       - Function name overlap with query words
+    
+    Args:
+        explain: If True, return (score, explanation_dict) with breakdown.
     """
     cfg = config or SymdexConfig.from_env()
     score = 0.0
     weights = cfg.search_ranking_weights
+    explanation = {} if explain else None
     
     # Use centralized stop words from config
     stop_words = cfg.stop_words
@@ -1011,8 +1079,13 @@ def calculate_search_score(
         # Domain match or explicit mismatch penalty
         if pattern_parts[0] == result_parts[0]:
             score += weights["domain_match"]
+            if explain:
+                explanation["domain_match"] = weights["domain_match"]
         elif pattern_parts[0] != "*" and result_parts[0] != pattern_parts[0]:
-            score += weights.get("domain_mismatch_penalty", -3.0)
+            penalty = weights.get("domain_mismatch_penalty", -3.0)
+            score += penalty
+            if explain:
+                explanation["domain_mismatch"] = penalty
 
         # Action and Object
         pattern_aop = pattern_parts[1].split('--')
@@ -1025,39 +1098,153 @@ def calculate_search_score(
             if len(pattern_ao) == 2 and len(result_ao) == 2:
                 pat_act, pat_obj = pattern_ao
                 res_act, res_obj = result_ao
+                res_obj_parts = [p.strip() for p in res_obj.split('+') if p.strip()]
                 
                 # Action match
                 if pat_act == res_act or pat_act == '*':
                     score += weights["action_match"]
+                    if explain:
+                        explanation["action_match"] = weights["action_match"]
                 
-                # Object exact / wildcard match
-                if pat_obj == res_obj or pat_obj == '*':
+                # Object exact / wildcard match (compound OBJ: match if pattern equals any part or full)
+                if pat_obj == '*' or pat_obj == res_obj or (res_obj_parts and pat_obj in res_obj_parts):
                     score += weights["object_match"]
+                    if explain:
+                        explanation["object_match"] = weights["object_match"]
                 else:
-                    # Soft similarity between object codes, e.g. DATASET vs DSET
-                    sim = _object_similarity(pat_obj, res_obj)
-                    score += sim * weights.get("object_similarity", 0.0)
+                    # Soft similarity: best match over compound parts
+                    sim = max(
+                        _object_similarity(pat_obj, part) for part in (res_obj_parts or [res_obj])
+                    )
+                    obj_score = sim * weights.get("object_similarity", 0.0)
+                    score += obj_score
+                    if explain and obj_score > 0:
+                        explanation["object_similarity"] = obj_score
             
             # Pattern match
             if pattern_aop[1] == result_aop[1] or pattern_aop[1] == '*':
                 score += weights["pattern_match"]
+                if explain:
+                    explanation["pattern_match"] = weights["pattern_match"]
     
     # Exact match bonus
     if cypher_pattern == result_cypher:
         score += weights["exact_match"]
-    
+        if explain:
+            explanation["exact_match"] = weights["exact_match"]
+
     # ── Query word matching ──
     query_words = {
         w for w in query.lower().split()
         if w not in stop_words and len(w) > 1
     }
+
+    # ── Fuzzy Object Matching (domain-agnostic) ──
+    # Extract Cypher object from result (single or compound: OBJ1+OBJ2+OBJ3)
+    result_obj = ""
+    result_obj_parts: List[str] = []
+    result_action = ""
+    if len(result_parts) == 2:
+        aop = result_parts[1].split("--")
+        if len(aop) == 2:
+            ao = aop[0].split("_")
+            if len(ao) == 2:
+                result_action = ao[0]
+                result_obj = ao[1].lower()
+                result_obj_parts = [p.strip().lower() for p in result_obj.split("+") if p.strip()]
+                if not result_obj_parts:
+                    result_obj_parts = [result_obj]
     
+    if result_obj and query_words:
+        from difflib import SequenceMatcher
+        
+        fuzzy_boost = weights.get("object_semantic_match", 3.0)
+        multi_obj_boost = weights.get("multi_object_match", 6.0)
+        parts_for_match = result_obj_parts if result_obj_parts else [result_obj]
+        
+        best_overall_score = 0.0
+        best_match_word = None
+        for qw in query_words:
+            best_for_word = max(
+                SequenceMatcher(None, qw, part).ratio() if (qw not in part and part not in qw)
+                else 1.0
+                for part in parts_for_match
+            )
+            if best_for_word > best_overall_score:
+                best_overall_score = best_for_word
+                best_match_word = qw
+        
+        # Count how many distinct OBJ parts have at least one query-word match
+        parts_with_match = 0
+        for part in parts_for_match:
+            if any(
+                SequenceMatcher(None, qw, part).ratio() >= 0.6 or qw in part or part in qw
+                for qw in query_words
+            ):
+                parts_with_match += 1
+        
+        # Single best fuzzy match boost
+        if best_overall_score >= 0.6:
+            similarity_boost = best_overall_score * fuzzy_boost
+            score += similarity_boost
+            if explain:
+                explanation["object_fuzzy_match"] = {
+                    "query_word": best_match_word,
+                    "object": result_obj,
+                    "similarity": round(best_overall_score, 3),
+                    "score": round(similarity_boost, 2)
+                }
+        
+        # Multi-object boost: query mentions multiple concepts that match multiple OBJ parts
+        if len(parts_for_match) >= 2 and parts_with_match >= 2:
+            score += multi_obj_boost
+            if explain:
+                explanation["multi_object_match"] = {
+                    "parts_matched": parts_with_match,
+                    "object_parts": parts_for_match,
+                    "score": multi_obj_boost
+                }
+
+    # ── Action-Object Coherence (domain-agnostic) ──
+    # Boost when query contains BOTH an action AND object that match the result Cypher
+    if result_action and result_obj and query_words:
+        # Detect if query contains an action keyword
+        detected_action = None
+        for qw in query_words:
+            if qw in CypherSchema.KEYWORD_TO_ACTION:
+                detected_action = CypherSchema.KEYWORD_TO_ACTION[qw]
+                break
+        
+        if detected_action and detected_action == result_action:
+            # Check if any query word fuzzy-matches any OBJ part (single or compound)
+            from difflib import SequenceMatcher
+            coherence_parts = result_obj_parts if result_obj_parts else [result_obj]
+            for qw in query_words:
+                for part in coherence_parts:
+                    if (SequenceMatcher(None, qw, part).ratio() >= 0.6
+                            or qw in part or part in qw):
+                        coherence_boost = weights.get("semantic_pair_match", 8.0)
+                        score += coherence_boost
+                        if explain:
+                            explanation["action_object_coherence"] = {
+                                "action": detected_action,
+                                "object_match": qw,
+                                "score": coherence_boost
+                            }
+                        break
+                else:
+                    continue
+                break  # Only apply once per result
+
     # Tag relevance
     matching_tags = sum(
         1 for tag in tags
         if any(word in tag.lower() for word in query_words)
     )
-    score += matching_tags * weights["tag_match"]
+    tag_score = matching_tags * weights["tag_match"]
+    score += tag_score
+    if explain and tag_score > 0:
+        explanation["tag_matches"] = {"count": matching_tags, "score": tag_score}
     
     # Function name relevance — exact word overlap + substring matching.
     # Exact:     "delete" in query matches "delete" in snake_case parts.
@@ -1076,6 +1263,11 @@ def calculate_search_score(
             1 for qw in remaining if qw in name_lower
         )
 
-        score += (exact_hits + substr_hits * 0.7) * weights.get("name_match", 3.0)
+        name_score = (exact_hits + substr_hits * 0.7) * weights.get("name_match", 3.0)
+        score += name_score
+        if explain and name_score > 0:
+            explanation["name_matches"] = {"exact": exact_hits, "substring": substr_hits, "score": name_score}
 
+    if explain:
+        return score, explanation
     return score

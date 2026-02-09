@@ -12,9 +12,14 @@ Usage::
 """
 
 import logging
+import warnings
 from pathlib import Path
 
 import click
+
+# Suppress noisy dependency warnings during index/search
+warnings.filterwarnings("ignore", message=".*Pydantic V1.*Python 3.14.*", category=UserWarning, module="anthropic")
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="anyio")
 
 from symdex.core.config import Config, SymdexConfig
 from symdex.core.engine import CypherCache, scan_directory
@@ -30,9 +35,11 @@ def _configure_logging(verbose: bool, config: SymdexConfig | None = None) -> Non
     cfg = config or SymdexConfig.from_env()
     level = logging.DEBUG if verbose else getattr(logging, cfg.log_level)
     logging.basicConfig(level=level, format=cfg.log_format)
-    # Suppress noisy HTTP loggers
+    # Suppress noisy HTTP loggers and third-party debug output
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("anthropic._base_client").setLevel(logging.WARNING)
+    logging.getLogger("anthropic").setLevel(logging.WARNING)
 
 
 def _build_config(provider: str | None = None) -> SymdexConfig:
@@ -64,7 +71,18 @@ def _build_config(provider: str | None = None) -> SymdexConfig:
 )
 @click.pass_context
 def cli(ctx: click.Context, provider: str | None):
-    """Symdex-100 — Semantic fingerprints for 100x faster code search."""
+    """Symdex-100 — Semantic fingerprints for 100x faster code search.
+
+    Commands:
+      index   Build a sidecar index from Python source (uses LLM for Cyphers).
+      search  Query the index by natural language or Cypher pattern.
+      stats   Show index statistics (files, functions).
+      watch   Watch a directory and auto-reindex on file changes.
+      mcp     Start the MCP server for Cursor / Claude.
+
+    Configuration is read from the environment (e.g. ANTHROPIC_API_KEY,
+    SYMDEX_DEFAULT_MAX_RESULTS). See docs/CONFIGURATION.md for all options.
+    """
     ctx.ensure_object(dict)
     # Build an instance-based config and attach it to the Click context.
     # All subcommands read it from ctx.obj["config"].
@@ -82,8 +100,10 @@ def cli(ctx: click.Context, provider: str | None):
 @click.argument("directory", default=".", type=click.Path(exists=True, file_okay=False))
 @click.option("--cache-dir", type=click.Path(), default=None,
               help="Override sidecar index directory (default: DIRECTORY/.symdex).")
-@click.option("--force", is_flag=True, help="Force re-index all files, even if unchanged.")
-@click.option("--dry-run", is_flag=True, help="Analyse code without writing the index.")
+@click.option("--force", is_flag=True,
+              help="Force re-index all files, ignoring hash cache (slower, use after big refactors).")
+@click.option("--dry-run", is_flag=True,
+              help="Analyse code and show what would be indexed without writing to disk.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def index(ctx: click.Context, directory: str, cache_dir: str | None,
@@ -91,7 +111,8 @@ def index(ctx: click.Context, directory: str, cache_dir: str | None,
     """Index Python source files in DIRECTORY and build a sidecar search index.
 
     Metadata is stored in a .symdex/ directory — source files are never
-    modified. Python-only for v1 (multi-language support planned).
+    modified. Requires an LLM API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, or
+    GEMINI_API_KEY) unless SYMDEX_CYPHER_FALLBACK_ONLY=1. Python-only for v1.
     """
     cfg: SymdexConfig = ctx.obj["config"]
     _configure_logging(verbose, cfg)
@@ -130,22 +151,35 @@ def index(ctx: click.Context, directory: str, cache_dir: str | None,
               help="Directory containing the index (default: ./.symdex).")
 @click.option("-f", "--format", "fmt",
               type=click.Choice(["console", "json", "compact", "ide"]),
-              default="console", help="Output format.")
+              default="console",
+              help="Output: console (rich), json, compact (grep-like), ide (file:line).")
 @click.option("-n", "--max-results", type=int, default=None,
-              help="Maximum number of results.")
+              help="Maximum number of results (default: from config, typically 5).")
 @click.option("-p", "--page-size", type=int, default=None,
-              help="Results per page (enables interactive pagination).")
+              help="Results per page; enables interactive pagination (Enter=next, q=quit).")
 @click.option("--strategy",
               type=click.Choice(["auto", "llm", "keyword", "direct"]),
-              default="auto", help="Query translation strategy.")
+              default="auto",
+              help="auto=LLM or keyword fallback, llm=force LLM, keyword=no LLM, direct=Cypher only.")
 @click.option("--min-score", type=float, default=None,
-              help="Minimum relevance score to display.")
+              help="Minimum relevance score to show (default: CYPHER_MIN_SCORE or 5.0).")
+@click.option("--context-lines", type=int, default=3,
+              help="Lines of code preview per result (default: 3; use 10-15 for editing).")
+@click.option("--include-tests", is_flag=True,
+              help="Include test functions (by default tests are excluded).")
+@click.option("--explain", is_flag=True,
+              help="Print scoring breakdown per result (action/object/domain/name contributions).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def search(ctx: click.Context, query: str, cache_dir: str | None, fmt: str,
            max_results: int | None, page_size: int | None,
-           strategy: str, min_score: float | None, verbose: bool):
-    """Search the Symdex index with a natural-language QUERY or Cypher pattern."""
+           strategy: str, min_score: float | None, context_lines: int,
+           include_tests: bool, explain: bool, verbose: bool):
+    """Search the Symdex index with a natural-language QUERY or Cypher pattern.
+
+    QUERY can be a phrase (e.g. "validate user token") or a Cypher pattern
+    (e.g. SEC:VAL_*--ASY). Use --explain to see why results rank as they do.
+    """
     cfg: SymdexConfig = ctx.obj["config"]
     _configure_logging(verbose, cfg)
     _validate_config(cfg)
@@ -169,7 +203,8 @@ def search(ctx: click.Context, query: str, cache_dir: str | None, fmt: str,
     except ImportError as exc:
         click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
-    results = engine.search(query, strategy=strategy, max_results=max_results)
+    exclude_tests = not include_tests  # Default: exclude tests (normal use)
+    results = engine.search(query, strategy=strategy, max_results=max_results, context_lines=context_lines, exclude_tests=exclude_tests, explain=explain)
 
     # Apply minimum score filter
     score_threshold = min_score if min_score is not None else cfg.min_search_score
@@ -286,7 +321,7 @@ def _display_console_results(
               help="Directory containing the index (default: ./.symdex).")
 @click.pass_context
 def stats(ctx: click.Context, cache_dir: str | None):
-    """Show Symdex index statistics."""
+    """Show Symdex index statistics (indexed files and function count)."""
     cfg: SymdexConfig = ctx.obj["config"]
     cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
     db = cfg.get_cache_path(cache_path)
@@ -312,11 +347,17 @@ def stats(ctx: click.Context, cache_dir: str | None):
 
 @cli.command()
 @click.option("--transport", type=click.Choice(["stdio", "streamable-http", "sse"]),
-              default="stdio", help="MCP transport (default: stdio; use streamable-http for Smithery).")
-@click.option("-v", "--verbose", is_flag=True)
+              default="stdio",
+              help="stdio=local Cursor (default), streamable-http=Smithery/remote, sse=legacy.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def mcp(ctx: click.Context, transport: str, verbose: bool):
-    """Start the Symdex MCP server for Cursor / Claude integration."""
+    """Start the Symdex MCP server for Cursor / Claude integration.
+
+    Tool defaults (max_results, context_lines, exclude_tests) are read from
+    config; set SYMDEX_DEFAULT_MAX_RESULTS, SYMDEX_DEFAULT_CONTEXT_LINES,
+    SYMDEX_DEFAULT_EXCLUDE_TESTS to change them. See docs/CONFIGURATION.md.
+    """
     cfg: SymdexConfig = ctx.obj["config"]
     _configure_logging(verbose, cfg)
     try:

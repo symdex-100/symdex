@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+      "symdex": {
+        "command": "symdex",
+        "args": ["mcp"]
+      }
+    }
+  }
