@@ -12,7 +12,7 @@
 
 **Semantic fingerprints for intent-based Python code search — 50–100x faster index lookups, 10–50x fewer tokens for AI agents.**
 
-Symdex-100 generates compact, structured metadata ("Cyphers") for every function in your Python codebase. Each Cypher is a 20-byte semantic fingerprint that enables sub-second, intent-based code search for developers and AI agents — without reading thousands of lines of code.
+Symdex-100 generates compact, structured metadata ("Cyphers") for every function in your Python codebase. Each Cypher is typically 20 bytes — a semantic fingerprint that enables sub-second, intent-based code search for developers and AI agents without reading thousands of lines of code.
 
 ```python
 # Your Python function → Indexed automatically
@@ -50,12 +50,13 @@ Traditional code search methods scale poorly on large codebases:
 
 | Approach | Limitation | Token Cost (AI agents) |
 |----------|-----------|------------------------|
-| **grep** | Keyword noise — finds "token" in comments, strings, variable names | 3,000+ tokens (read all matches) |
-| **Full-text search** | No semantic understanding — can't distinguish intent | 5,000+ tokens (read 10 files) |
-| **Embeddings** | Opaque, expensive, query-time overhead | 2,000+ tokens (re-rank results) |
+| **grep** | Keyword noise — finds "token" in comments, strings, variable names | 3,000+ tokens (read all matches, many false positives) |
+| **Full-text search** | No semantic understanding — can't distinguish intent | 5,000+ tokens (read 10 files, variable success) |
+| **Embeddings** | Opaque, expensive, query-time overhead | 2,000+ tokens (re-rank results, embedding index size) |
 | **AST/LSP** | Limited to structural queries (class/function names) | N/A (doesn't understand "what validates X") |
+| **Symdex** | Requires indexing step (one-time per codebase) | ~100–300 tokens (1–5 precise results with context) |
 
-**Result**: Developers waste time reading irrelevant code. AI agents burn tokens on noise.
+**Result**: Developers waste time reading irrelevant code. AI agents burn tokens on noise. Symdex reduces token usage by **10–50x** for intent-based queries (vs reading multiple files) while providing sub-second index lookups.
 
 ---
 
