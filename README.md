@@ -84,7 +84,7 @@ Each Cypher follows a strict four-slot hierarchy designed for both machine filte
 **Formal specification:**
 
 $$
-\text{Cypher} = \text{DOM} : \text{ACT} \_ \text{OBJ} \text{--} \text{PAT}
+\text{Cypher} = \text{DOM} : \text{ACT} \text{OBJ} \text{--} \text{PAT}
 $$
 
 Where:
@@ -127,9 +127,6 @@ This 18-character string (or 30–40 chars with compound OBJ like `RELATIONSHIPS
 |--------|------|------------------|-------------|
 | Data scanned per query | ~50MB (full codebase) | ~100KB (index) | **500x less I/O** |
 | Index lookup (5,000 functions) | 800ms | 8ms | **100x faster** |
-| Index lookup (234 functions, real test) | N/A | **<50ms** | Sub-second even on small indexes |
-| Index size | N/A (no index) | 2MB (5,000 functions) | **25:1 compression** |
-| Index size (real test, 234 functions) | N/A | **~150KB** | Minimal overhead |
 
 **Technical details:**
 - SQLite B-tree: O(log N) lookups with compound indexes on `(cypher, tags, function_name)`
@@ -167,17 +164,7 @@ Merge + Cap candidates (default 200) + Score against tight pattern
 Ranked Results (exact match + domain/action/object = highest score)
 ```
 
-**Scoring:** ACT (action) and OBJ (object) dominate — they encode *what* the function does and *on what*. Domain and pattern follow. Wrong domain (e.g. result is TST when query asked for BIZ) is penalized. Compound OBJ (e.g. `RELATIONSHIPS+AUDIT`) gets a multi-object boost when multiple query terms match multiple OBJ parts.
-
-$$
-\text{score} = 12[\text{exact}] + 6[\text{action}] + 7[\text{object}] + 4[\text{domain}] + 2[\text{pattern}] + 6[\text{name}] + 4[\text{tags}] + 3[\text{fuzzy obj}] + 6[\text{multi-obj}] + 8[\text{action-object}] - 3[\text{domain mismatch}]
-$$
-
-Where $[\text{x}]$ is 1 if matched, 0 otherwise. Fuzzy object matching uses string similarity (0.6+ threshold). Multi-object boost applies when 2+ query terms match 2+ OBJ parts in compound OBJ (e.g. "audit relations" → `RELATIONSHIPS+AUDIT`). Action-object coherence boosts when query action matches result action AND query object matches result object.
-
 **Result**: High precision from tiered + tight-pattern scoring; cross-domain recall when needed; fewer irrelevant results (candidate cap, Lane 3 skip, smaller tag/name limits).
-
-**Independent testing** (medium codebase, ~3000 functions, re-indexed with compound OBJ support): For intent-based queries like "stores the basic audit relations into the db", the correct function appeared in the **top 5**; with compound OBJ (`RELATIONSHIPS+AUDIT`), ranking improved when queries mention multiple concepts. More specific wording (e.g. "store developer expertise from commit data") typically ranks target functions #1–#5. **Real-world performance**: Natural-language queries like "calculate search score", "add cypher entry to index", "extract context from file" returned the correct function in **position #1** with sub-second DB lookup. Compound OBJ appeared in ~30% of indexed functions (e.g. `CRT_RECORD+INDEX`, `FET_FILE+CACHE`, `CRT_INDEX+DIR`), improving ranking for multi-concept queries. The right answer is typically in the first result set — scan the top 5–10 when multiple candidates share the same domain.
 
 ---
 
@@ -196,25 +183,10 @@ Where $[\text{x}]$ is 1 if matched, 0 otherwise. Fuzzy object matching uses stri
 | **Symdex (1 result)** | `search_codebase("validate login credentials")` → 1 precise result | ~100 | **50x reduction** |
 | **Symdex (5 results)** | Same query → top 5 results with context | ~300 | **10–15x reduction** vs reading 10 files |
 
-**Token breakdown (Symdex approach, 1 result):**
-- Query: 20 tokens
-- MCP tool call overhead: 30 tokens
-- Result (1 function, 3-line preview): 50 tokens
-- **Total: ~100 tokens**
-
-**Token breakdown (Symdex approach, 5 results):**
-- Query: 20 tokens
-- MCP tool call overhead: 30 tokens
-- Results (5 functions, 3-line preview each): ~250 tokens
-- **Total: ~300 tokens**
-
 **Savings:** 
 - **50x fewer tokens** when the alternative is reading 10+ files or scanning many grep hits
 - **10–15x fewer tokens** when returning 5 results vs reading 10 files
 - **2–3x fewer tokens** when the alternative is reading 1–2 files (fewer file opens, result set instead of full file)
-- **Real-world testing:** On Symdex codebase (234 functions), queries like "calculate search score" returned 1–2 high-signal results (~100–200 tokens) vs reading 3–5 files (~1,500–2,500 tokens) = **7–25x reduction**
-
-Typically one or a few high-signal results; scan the top 5–10 when several functions share the same Cypher shape. Compound OBJ improves ranking for multi-concept queries (e.g. "audit relations" → functions with `RELATIONSHIPS+AUDIT` rank higher).
 
 **Why this matters:**
 - 200K context window → explore 50x more functions
@@ -269,8 +241,6 @@ Effectiveness correlates with codebase size:
 2. **Simple string search** — Use grep/IDE search for exact identifiers or literals
 3. **Non-Python codebases** — Currently Python-only (JS/TS/Go/Rust support planned)
 4. **Extremely small projects** (<50 functions) — Overhead of indexing outweighs benefits
-
-**Evidence from real-world testing:** On a Django codebase of ~400 files and ~2,700 indexed functions, Symdex was compared to grep for two tasks: (1) find the function that stores basic audit relations, (2) find the function(s) that match contributors and commits and store the result. For (1), one Symdex query returned the correct function at position #5 with enough context to confirm without opening the file; grep required the exact phrase in the code or multiple queries and file reads. For (2), Symdex needed a more specific query ("store developer expertise from commit data") to rank the targets first; then both target functions appeared in one result set with no file read. Grep got there in two queries and one full file read. Conclusion: Symdex is most effective for intent-based discovery when you don't know the exact name or wording in the source; combine with grep for exact identifiers. See agent/IDE workflows in AGENTS.md.
 
 ### How to Use Symdex Effectively
 
@@ -697,14 +667,6 @@ Agent: "Now I know exactly where to look"
 | *"add cypher entry to the index or cache"* | 8 | **<50ms** | #1 correct | Compound OBJ: `CRT_RECORD+INDEX` |
 | *"extract context or get lines of code from file"* | 8 | **<50ms** | #1 correct | Compound OBJ: `FET_FILE+TEXT`, `FET_FILE+CACHE` |
 | *"something that writes or stores things"* | 10 | **<50ms** | Top 10 relevant | Vague query; compound OBJ helps (`SCR_FILE+RECORD`) |
-
-**Medium codebase (≈2,700–3,000 functions, ≈400–500 indexed files):**
-
-| Query | Results | DB time | Note |
-|-------|---------|---------|------|
-| *"force delete data and directory of repository"* | 208 | &lt;1s | Multi-lane, direct-style pattern |
-| *"where does the AI model analyze for dependencies"* | **76** | **0.36s** | Tiered Cypher (tight BIZ:AGG_DEPS--SYN first); ~11× fewer results than pre-tiered, ~2.5× faster |
-| *Intent queries (e.g. "stores basic audit relations", "store developer expertise from commit data")* | 5–15 | &lt;1s | Correct function typically in top 5–10; DB time sub-second; LLM translation extra |
 
 **Synthetic benchmark (5,000 indexed functions, cold SQLite cache):**
 
