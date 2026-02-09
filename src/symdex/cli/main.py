@@ -35,9 +35,11 @@ def _configure_logging(verbose: bool, config: SymdexConfig | None = None) -> Non
     cfg = config or SymdexConfig.from_env()
     level = logging.DEBUG if verbose else getattr(logging, cfg.log_level)
     logging.basicConfig(level=level, format=cfg.log_format)
-    # Suppress noisy HTTP loggers
+    # Suppress noisy HTTP loggers and third-party debug output
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("anthropic._base_client").setLevel(logging.WARNING)
+    logging.getLogger("anthropic").setLevel(logging.WARNING)
 
 
 def _build_config(provider: str | None = None) -> SymdexConfig:
