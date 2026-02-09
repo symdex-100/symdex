@@ -181,6 +181,10 @@ class IndexingPipeline:
     def _build_result(self) -> IndexResult:
         """Convert internal stats dict into a typed IndexResult."""
         cache_stats = self.cache.get_stats()
+        
+        # Generate summary with top files and domains
+        summary = self._generate_summary()
+        
         return IndexResult(
             files_scanned=self.stats["files_scanned"],
             files_processed=self.stats["files_processed"],
@@ -191,6 +195,7 @@ class IndexingPipeline:
             errors=self.stats["errors"],
             root_dir=str(self.root_dir),
             index_dir=str(self.cache_dir),
+            summary=summary,
         )
 
     def _process_file(self, file_path: Path) -> bool:
@@ -257,12 +262,17 @@ class IndexingPipeline:
             signature = self.analyzer.generate_signature(func_meta)
             complexity = self.analyzer.estimate_complexity_class(func_meta.complexity)
 
-            # Persist to the sidecar SQLite index
+            # Persist to the sidecar SQLite index (relative_path for portable context resolution)
             if not self.dry_run:
+                try:
+                    rel_path = str(file_path.relative_to(self.root_dir)).replace("\\", "/")
+                except ValueError:
+                    rel_path = None
                 self.cache.add_cypher_entry(
                     file_path, func_meta.name,
                     func_meta.start_line, func_meta.end_line,
                     cypher, tags, signature, complexity,
+                    relative_path=rel_path,
                 )
 
             return True
@@ -334,6 +344,41 @@ class IndexingPipeline:
 
         # Return up to 12 unique tags (more signal = better search)
         return sorted(tags)[:12]
+
+    def _generate_summary(self) -> dict:
+        """Generate a post-indexing summary with top files and domains.
+        Uses the same table name as CypherCache (cypher_index).
+        """
+        import sqlite3
+
+        conn = self.cache._get_connection()
+        prev_factory = conn.row_factory
+        conn.row_factory = sqlite3.Row
+        try:
+            # Top 5 files by function count (table is cypher_index, not "functions")
+            top_files = conn.execute("""
+                SELECT file_path, COUNT(*) as count
+                FROM cypher_index
+                GROUP BY file_path
+                ORDER BY count DESC
+                LIMIT 5
+            """).fetchall()
+
+            # Domain distribution (e.g. SEC, DAT, NET from first part of cypher)
+            domains = conn.execute("""
+                SELECT SUBSTR(cypher, 1, INSTR(cypher, ':') - 1) as domain, COUNT(*) as count
+                FROM cypher_index
+                WHERE cypher LIKE '%:%'
+                GROUP BY domain
+                ORDER BY count DESC
+            """).fetchall()
+
+            return {
+                "top_files": [{"file": row["file_path"], "functions": row["count"]} for row in top_files],
+                "domain_distribution": {row["domain"]: row["count"] for row in domains},
+            }
+        finally:
+            conn.row_factory = prev_factory
 
     def print_statistics(self):
         """Print final indexing statistics in a human-readable format.

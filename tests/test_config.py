@@ -68,7 +68,8 @@ class TestConfig:
     def test_search_ranking_weights_has_required_keys(self):
         required = {
             "exact_match", "domain_match", "action_match",
-            "object_match", "pattern_match", "tag_match",
+            "object_match", "object_semantic_match", "multi_object_match",
+            "semantic_pair_match", "pattern_match", "tag_match", "name_match",
         }
         assert required.issubset(set(Config.SEARCH_RANKING_WEIGHTS.keys()))
 
@@ -211,7 +212,7 @@ class TestSymdexConfig:
         cfg1 = SymdexConfig()
         cfg2 = SymdexConfig()
         cfg1.search_ranking_weights["exact_match"] = 999.0
-        assert cfg2.search_ranking_weights["exact_match"] == 10.0
+        assert cfg2.search_ranking_weights["exact_match"] == 12.0  # Current default
 
 
 class TestConfigToInstance:

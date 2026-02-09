@@ -49,7 +49,7 @@ class SymdexConfig:
 
     # ── Rate Limiting ─────────────────────────────────────────────
     max_requests_per_minute: int = 50
-    max_concurrent_requests: int = 5
+    max_concurrent_requests: int = 15
     retry_attempts: int = 3
     retry_backoff_base: float = 2.0
 
@@ -77,6 +77,10 @@ class SymdexConfig:
     max_search_results: int = 5
     max_search_candidates: int = 200  # Cap merged candidates before scoring (0 = no cap)
     min_search_score: float = 5.0
+    # Defaults used by MCP / API when caller does not specify (overridable via env)
+    default_context_lines: int = 3
+    default_max_search_results: int = 10  # MCP/API often want more than 5 for exploration
+    default_exclude_tests: bool = True  # Normal use: exclude test code by default; set False or use SYMDEX_DEFAULT_EXCLUDE_TESTS=0 to include
     stop_words: frozenset = frozenset({
         "i", "a", "the", "is", "it", "do", "we", "my", "me", "an", "in",
         "to", "for", "of", "and", "or", "on", "at", "by", "with", "from",
@@ -85,17 +89,20 @@ class SymdexConfig:
         "code", "define", "does", "are", "was", "were", "been", "being",
         "have", "has", "had", "having", "can", "could", "should", "would",
     })
-    # Weights: ACT and OBJ dominate (what it does, on what), then DOM, then PAT.
+    # Weights: Ranking is domain-agnostic; compound OBJ (OBJ1+OBJ2+OBJ3) gets multi-object boost.
     search_ranking_weights: dict = field(default_factory=lambda: {
-        "exact_match": 10.0,
+        "exact_match": 12.0,
         "domain_match": 4.0,
         "action_match": 6.0,
-        "object_match": 5.0,
+        "object_match": 7.0,
         "object_similarity": 2.0,
+        "object_semantic_match": 3.0,   # fuzzy: query word → Cypher object (single or part of compound)
+        "multi_object_match": 6.0,     # 2+ query terms match 2+ OBJ parts (e.g. "audit relations" → RELATIONSHIPS+AUDIT)
+        "semantic_pair_match": 8.0,    # action+object coherence
         "pattern_match": 2.0,
         "domain_mismatch_penalty": -3.0,
-        "tag_match": 1.5,
-        "name_match": 3.0,
+        "tag_match": 4.0,
+        "name_match": 6.0,
     })
 
     # ── Logging ───────────────────────────────────────────────────
@@ -113,6 +120,23 @@ class SymdexConfig:
         """
         fallback_raw = os.getenv("SYMDEX_CYPHER_FALLBACK_ONLY", "").lower()
         cypher_fallback_only = fallback_raw in ("1", "true", "yes", "on")
+        def _int_env(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                return default
+
+        def _bool_env(name: str, default: bool) -> bool:
+            raw = os.getenv(name, "").lower()
+            if raw in ("1", "true", "yes", "on"):
+                return True
+            if raw in ("0", "false", "no", "off"):
+                return False
+            return default
+
         return cls(
             llm_provider=os.getenv("SYMDEX_LLM_PROVIDER", "anthropic").lower(),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -121,10 +145,13 @@ class SymdexConfig:
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-            llm_max_tokens=int(os.getenv("SYMDEX_MAX_TOKENS", "300")),
+            llm_max_tokens=_int_env("SYMDEX_MAX_TOKENS", 300),
             min_search_score=float(os.getenv("CYPHER_MIN_SCORE", "5.0")),
             log_level=os.getenv("CYPHER_LOG_LEVEL", "INFO"),
             cypher_fallback_only=cypher_fallback_only,
+            default_context_lines=_int_env("SYMDEX_DEFAULT_CONTEXT_LINES", 3),
+            default_max_search_results=_int_env("SYMDEX_DEFAULT_MAX_RESULTS", 10),
+            default_exclude_tests=_bool_env("SYMDEX_DEFAULT_EXCLUDE_TESTS", True),
         )
 
     # ── Validation & Accessors ────────────────────────────────────
@@ -258,15 +285,18 @@ class Config:
     })
     
     SEARCH_RANKING_WEIGHTS: dict = {
-        "exact_match": 10.0,
+        "exact_match": 12.0,
         "domain_match": 4.0,
         "action_match": 6.0,
-        "object_match": 5.0,
+        "object_match": 7.0,
         "object_similarity": 2.0,
+        "object_semantic_match": 3.0,
+        "multi_object_match": 6.0,
+        "semantic_pair_match": 8.0,
         "pattern_match": 2.0,
         "domain_mismatch_penalty": -3.0,
-        "tag_match": 1.5,
-        "name_match": 3.0,
+        "tag_match": 4.0,
+        "name_match": 6.0,
     }
     
     # Logging
@@ -501,7 +531,7 @@ ACTION CODES:
 PATTERN CODES:
 {chr(10).join(f"- {code}: {desc}" for code, desc in cls.PATTERNS.items())}
 
-COMMON OBJECT CODES (preferred OBJ tokens):
+COMMON OBJECT CODES (use for OBJ; can combine: OBJ or OBJ+OBJ or OBJ+OBJ+OBJ, max 3):
 {chr(10).join(f"- {code}" for code in cls.COMMON_OBJECT_CODES)}
 """
 
@@ -520,35 +550,37 @@ The Cypher format is: DOM:ACT_OBJ--PAT
 Where:
 - DOM (Domain, 2-3 uppercase letters): Pick from {list(CypherSchema.DOMAINS.keys())}
 - ACT (Action, 3 uppercase letters): Pick from {list(CypherSchema.ACTIONS.keys())}
-- OBJ (Object, 2-20 uppercase letters/digits): Choose a token from COMMON OBJECT CODES whenever possible (e.g. DATASET, USER, REQUEST, JSON, CSV, CACHE, RELATIONSHIPS, RECOMMENDATIONS). Prefer full, readable words like DATASET over cryptic abbreviations like DSET.
+- OBJ (Object): PRIMARY object from COMMON OBJECT CODES below. You MAY add +SECONDARY and optionally +TERTIARY (all from the same list) when the function clearly involves multiple objects. Format: OBJ or OBJ+OBJ or OBJ+OBJ+OBJ (max 3 parts). Primary = main thing the function creates/fetches/updates; secondary/tertiary = context or other entities involved.
 - PAT (Pattern, 3 uppercase letters): Pick from {list(CypherSchema.PATTERNS.keys())}
 
 {CypherSchema.format_for_llm()}
 
 RULES:
-1. Choose exactly ONE code from each category (DOM, ACT, PAT must be from the lists above)
-2. OBJ is 2-20 uppercase letters or digits. When the object matches a COMMON OBJECT CODE, use that exact token (e.g. DATASET, USER, REQUEST, RELATIONSHIPS, RECOMMENDATIONS). Avoid inventing new abbreviations (do NOT use DSET if DATASET is available).
-3. If uncertain, choose the most specific applicable code
-4. Output ONLY the Cypher string, nothing else — no explanations, no caveats
-5. Be consistent: same code logic should always produce the same Cypher
-6. **CRITICAL — Non-classifiable code:** If the code is NOT a complete function or method — for example it is a code fragment, a conditional branch (if/else), a loop body, a variable declaration, a single statement, or any incomplete/unidentifiable snippet — respond with exactly the word: SKIP
-   Do NOT explain why. Do NOT describe what is wrong. Just output: SKIP
+1. DOM, ACT, PAT: exactly ONE code from the lists above.
+2. OBJ: Always choose a PRIMARY from COMMON OBJECT CODES. Then ask: does the function name, docstring, or logic clearly involve a second (or third) object? If yes, append with + (e.g. RELATIONSHIPS+AUDIT, DATASET+EXPERTISE, RECORD+AUDIT). Use compound when:
+   - The function name contains multiple object-like words (e.g. create_audit_entity_and_relations → RELATIONSHIPS+AUDIT; store_developer_expertise → DATASET+EXPERTISE).
+   - The function operates on or in the context of two distinct entities (e.g. "writes audit summary" → RECORD+AUDIT; "fetch user from session" → USER+SESSION).
+   - A single object would be too vague (e.g. "insert audit data into db" can be RECORD+AUDIT to distinguish from generic RECORD).
+3. If uncertain, choose the most specific applicable code. Prefer 2-part OBJ when in doubt between one broad vs two specific objects.
+4. Output ONLY the Cypher string, nothing else — no explanations, no caveats.
+5. Be consistent: same code logic should always produce the same Cypher.
+6. **CRITICAL — Non-classifiable code:** If the code is NOT a complete function or method (fragment, branch, loop body, single statement, incomplete snippet), respond with exactly: SKIP
 
-EXAMPLES:
-- Python: "async def send_email(to, subject): ..." → NET:SND_EMAL--ASY
-- Python: "def validate_password(pwd): ..." → SEC:VAL_PASS--SYN
-- Python: "def fetch_user_data(user_id): ..." → DAT:FET_USER--SYN
-- Python: "async def scrub_sensitive_logs(stream): ..." → LOG:SCR_LOGS--ASY
-- Python: "def transform_csv_to_json(csv_data): ..." → DAT:TRN_JSON--SYN
+EXAMPLES (single OBJ when one clear object; compound when multiple objects):
+- "async def send_email(to, subject): ..." → NET:SND_EMAL--ASY
+- "def validate_password(pwd): ..." → SEC:VAL_PASS--SYN
+- "def fetch_user_data(user_id): ..." → DAT:FET_USER--SYN
+- "def create_audit_entity_and_relations(repo_url, audit_result_uuid, ...): ..." → DAT:CRT_RELATIONSHIPS+AUDIT--SYN
+- "def store_developer_commits(self, audit_uuid): ..." → DAT:AGG_DATASET+DEVELOPER+COMMITS--SYN
 """
     
-    CYPHER_GENERATION_USER = """Analyze this Python function and generate its Cypher:
+    CYPHER_GENERATION_USER = """Analyze this Python function and generate its Cypher.
 
 ```python
 {code}
 ```
 
-Output only the Cypher string in format DOM:ACT_OBJ--PAT"""
+Output only the Cypher string in format DOM:ACT_OBJ--PAT. No explanation."""
     
     QUERY_TRANSLATION_SYSTEM = f"""You are a natural language to Cypher-100 query translator.
 
@@ -564,7 +596,7 @@ Output exactly THREE Cypher patterns, one per line, in order of precision:
 3. BROAD: Fallback with wildcards (e.g. *:ACT_*--* or DOM:*_*--*) to catch related code.
 
 RULES:
-- For OBJ, use COMMON OBJECT CODES that match the query noun (e.g. "dependencies" → DEPS or DEPENDENCY, "dataset" → DATASET).
+- For OBJ, use COMMON OBJECT CODES. Use compound OBJ (e.g. RELATIONSHIPS+AUDIT) when the query mentions multiple nouns (e.g. "audit relations" → RELATIONSHIPS+AUDIT).
 - Prefer specific ACT when the query has a clear verb (e.g. "analyze" → AGG or FLT, "validate" → VAL).
 - When the query mentions "setup", "configure", "initialize" → ACT = CRT.
 - When the query mentions "logging", "log" as main subject → DOM = LOG, OBJ = LOGS.

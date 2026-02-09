@@ -21,7 +21,7 @@ DOM:ACT_OBJ--PAT
 
 DOM = Domain    (SEC, DAT, NET, SYS, LOG, UI, BIZ, TST)
 ACT = Action    (VAL, TRN, SND, FET, SCR, CRT, UPD, AGG, FLT, SYN)
-OBJ = Object    (USER, TOKEN, CONFIG, DATASET, LOGS, REQUEST, JSON, ...)
+OBJ = Object    (USER, TOKEN, CONFIG, DATASET, LOGS, REQUEST, JSON, ...). Can be compound when a function clearly involves multiple objects (e.g. RECORD+INDEX, FILE+CACHE, RELATIONSHIPS+AUDIT).
 PAT = Pattern   (ASY, SYN, REC, GEN, DEC, CTX, CLS)
 ```
 
@@ -40,7 +40,7 @@ token, async pattern."
 
 2. **You want to reduce context window usage** — instead of reading 10
    files (5,000+ tokens), call `search_codebase` and get 1–3 precise
-   hits (100–300 tokens).
+   hits (100–300 tokens with default context_lines=3).
 
 3. **You need to understand the codebase structure** — call
    `get_index_stats` to know the scale, then `search_codebase` with
@@ -49,6 +49,9 @@ token, async pattern."
 4. **The codebase has been indexed** — check with `get_index_stats`
    first.  If the index exists, prefer Symdex over raw file reading.
 
+5. **You'd otherwise read 3+ files** — If your task requires reading
+   multiple files to find the right function, use Symdex first.
+
 ### DO NOT use Symdex when:
 
 1. **You already know the exact file and line** — just read it directly.
@@ -56,6 +59,8 @@ token, async pattern."
    IDE search instead.
 3. **The project has not been indexed** — call `index_directory` first,
    or fall back to normal code exploration.
+4. **Very small codebases** (<50 functions) — indexing overhead
+   outweighs benefits; just read files directly.
 
 ---
 
@@ -63,16 +68,37 @@ token, async pattern."
 
 If Symdex is configured as an MCP server, you have these tools:
 
-### `search_codebase(query, path=".", strategy="auto", max_results=10)`
+### `search_codebase(query, path=".", strategy="auto", max_results=10, context_lines=3, exclude_tests=None)`
 
 **Your primary tool.** Pass a natural-language query or Cypher pattern.
 
 - **Natural language:** The LLM returns **three** Cypher patterns (tight, medium, broad). The engine tries the tight pattern first and only broadens if needed, so you get fewer irrelevant results and faster, more focused hits. Results are ranked against the tight pattern.
 - **Reported time** in tool output is **DB-only** (index lookup, scoring, context); LLM translation time is not included.
 
+**Parameters you can pass explicitly (recommended when the agent needs to adapt):**
+
+| Parameter | Default | When to override |
+|-----------|--------|-------------------|
+| `context_lines` | 3 (or server default) | Use **10–15** when you need to **edit** the found code (more context per result). Use **3** for quick exploration. |
+| `exclude_tests` | config default (**true**) | Set to **false** to include test code. When omitted, uses config (default: exclude tests for normal use). |
+
+**How an AI should create the query:**
+
+- **Exploration / “find where X”:** Use defaults (`context_lines=3`, tests excluded by default). Pass `exclude_tests=false` to include test code.
+- **Editing / “change the function that does X”:** Call with `context_lines=15`; tests remain excluded by default.
+
 ```
 # Natural language → tiered Cypher (tight first)
 search_codebase("where do we validate user tokens")
+
+# More context for editing (pass parameters explicitly)
+search_codebase("validate user tokens", context_lines=15)
+
+# Exclude test files when searching production code
+search_codebase("stores basic audit relations")  # tests excluded by default
+
+# Both: production-only, with enough context to edit
+search_codebase("create basic relations", context_lines=12)
 
 # Direct Cypher pattern (if you already know the shape)
 search_codebase("SEC:VAL_TOKEN--*")
@@ -152,13 +178,24 @@ from symdex import Symdex, SymdexConfig
 
 client = Symdex(config=SymdexConfig.from_env())
 
-# Index a project
+# Index a project (gets summary with top files + domain distribution)
 result = client.index("./project")
+print(result.summary)
+# {'top_files': [{'file': 'auth.py', 'functions': 47}],
+#  'domain_distribution': {'SEC': 23, 'DAT': 18}}
 
-# Search by intent
+# Search by intent (default: 3-line context)
 hits = client.search("validate user tokens", path="./project")
 for hit in hits:
-    print(f"{hit['file_path']}:{hit['line_start']}  {hit['cypher']}")
+    print(f"{hit.file_path}:{hit.line_start}  {hit.cypher}  score={hit.score}")
+
+# Search with more context for editing
+hits = client.search("validate user tokens", path="./project", context_lines=15)
+
+# Search with scoring explanation (debugging)
+hits = client.search("validate user tokens", path="./project", explain=True)
+print(hits[0].explanation)
+# {'action_match': 6.0, 'object_match': 5.0, 'name_matches': {'exact': 1, 'score': 3.0}}
 
 # Get stats
 stats = client.stats("./project")
@@ -175,21 +212,27 @@ Async variants are available: `client.aindex()`, `client.asearch()`,
 1. Health:  health()
              → Verify the MCP server is alive and configured
 
-2. Schema:  Read symdex://schema/full
+2. Schema:  Read symdex://schema/full (optional, for manual Cypher construction)
              → Learn the valid Cypher vocabulary
 
 3. Check:   get_index_stats(".")
              → If no index exists: index_directory(".")
              → If index exists: proceed to search
 
-4. Search:  search_codebase("your intent query")
-             → Returns ranked results with file, line, score, preview
+4. Search:  search_codebase("your intent query", context_lines=3)
+             → Returns ranked results with file, line, score, 3-line preview
+             → Use context_lines=10-15 for editing tasks (more tokens, better context)
 
 5. Read:    Open the top result's file at the specific line
              → You now have precise context, not a haystack
+             → OR if context_lines was high enough, edit directly from search result
 
 6. Act:     Make your edit / answer the question / generate the code
 ```
+
+**Key insight:** Start with `context_lines=3` for exploration (cheap, fast). Once you've identified the right function, either:
+- Read the full file at that line, OR
+- Re-search with `context_lines=15` to get enough context for editing
 
 ---
 
@@ -219,13 +262,13 @@ results by relevance.
 | Approach | Tokens used | Accuracy |
 |----------|------------|----------|
 | Read 10 files to find a function | ~5,000 | Low (might miss it) |
-| `search_codebase("validate password")` | ~100 | High (ranked, tiered precision) |
-| **Savings** | **50x fewer tokens** | **Higher accuracy** |
+| `search_codebase("validate password")` | ~100–300 | High (ranked, tiered precision; depends on result count and context_lines) |
+| **Savings** | **10–50x fewer tokens** | **Higher accuracy on intent-based queries** |
 
 Natural-language search uses **tiered Cypher** (tight → medium → broad) and a **candidate cap** so result sets stay focused (e.g. dozens of high-quality hits instead of hundreds of noisy ones).
 
 **Rule of thumb:** If you would otherwise read more than 3 files to
-answer a question, try Symdex first.
+answer a question, try Symdex first. Typical queries cost ~100–300 tokens (1–5 results with `context_lines=3`), versus 1,500–2,500 tokens for reading 3–5 files directly.
 
 ---
 

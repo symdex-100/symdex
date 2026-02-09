@@ -25,7 +25,11 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+
+# FastMCP uses pydantic for validation, so Field should be available
+# If ImportError occurs, it indicates fastmcp[mcp] extra wasn't installed
+from pydantic import Field  # type: ignore[import-untyped]
 
 from symdex.core.config import Config, CypherSchema, SymdexConfig
 from symdex.core.engine import CypherCache, scan_directory
@@ -82,10 +86,30 @@ def create_server(config: SymdexConfig | None = None):
 
     @mcp.tool()
     def search_codebase(
-        query: str,
-        path: str = ".",
-        strategy: str = "auto",
-        max_results: int = 10,
+        query: Annotated[
+            str,
+            Field(description="Natural-language query (e.g., 'validate user tokens') or Cypher pattern (e.g., 'SEC:VAL_TOKEN--*'). Use natural language for intent-based search; use Cypher patterns when you know the exact semantic fingerprint structure.")
+        ],
+        path: Annotated[
+            str,
+            Field(default=".", description="Root directory path whose Symdex index to search. Defaults to current working directory ('.'). The index must exist at <path>/.symdex/index.db.")
+        ] = ".",
+        strategy: Annotated[
+            str,
+            Field(default="auto", description="Search strategy: 'auto' (try LLM translation first, fallback to keyword), 'llm' (always use LLM to translate query to Cypher), 'keyword' (direct keyword matching), 'direct' (treat query as Cypher pattern). Use 'auto' unless you need specific behavior.")
+        ] = "auto",
+        max_results: Annotated[
+            int | None,
+            Field(default=None, description="Maximum number of results to return. If None, uses default from config (typically 10). Increase for broader exploration, decrease for focused results.")
+        ] = None,
+        context_lines: Annotated[
+            int | None,
+            Field(default=None, description="Number of lines of code context to include per result. Default is 3 (good for exploration). Use 10-15 when you need to edit the found code (more context = more tokens but better editing capability).")
+        ] = None,
+        exclude_tests: Annotated[
+            bool | None,
+            Field(default=None, description="If True, exclude test functions from results. If None, uses config default (typically True, excluding tests). Set to False to include test code in search results.")
+        ] = None,
     ) -> str:
         """Search the Symdex index for functions matching a natural-language
         query or a Cypher pattern (e.g. 'SEC:VAL_TOKEN--*').
@@ -93,11 +117,16 @@ def create_server(config: SymdexConfig | None = None):
         This is **much cheaper** than reading every file: a single call
         replaces thousands of tokens of raw code exploration.
 
-        Args:
-            query: Natural-language description or Cypher pattern.
-            path: Root directory whose index to search (default: cwd).
-            strategy: 'auto' | 'llm' | 'keyword' | 'direct'.
-            max_results: Maximum hits to return (default 10).
+        **When to use this tool:**
+        - You need to find code by intent (e.g., "where do we validate passwords")
+        - You want to reduce context window usage (instead of reading 10 files, get 1-3 precise hits)
+        - You'd otherwise read 3+ files to find a function
+        - The codebase has been indexed (check with get_index_stats first)
+
+        **When NOT to use:**
+        - You already know the exact file and line (just read it directly)
+        - You're searching for a specific string/identifier (use grep/IDE search instead)
+        - The project hasn't been indexed (call index_directory first)
 
         Returns:
             JSON array of matching functions with file, line, cypher,
@@ -105,9 +134,13 @@ def create_server(config: SymdexConfig | None = None):
         """
         from symdex.core.search import CypherSearchEngine, ResultFormatter
 
+        n = max_results if max_results is not None else cfg.default_max_search_results
+        ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        no_tests = exclude_tests if exclude_tests is not None else cfg.default_exclude_tests
+
         cache_dir = _resolve_cache(path)
         engine = CypherSearchEngine(cache_dir, config=cfg)
-        results = engine.search(query, strategy=strategy, max_results=max_results)
+        results = engine.search(query, strategy=strategy, max_results=n, context_lines=ctx_lines, exclude_tests=no_tests)
         return ResultFormatter.format_json(results)
 
     # ==================================================================
@@ -116,30 +149,44 @@ def create_server(config: SymdexConfig | None = None):
 
     @mcp.tool()
     def search_by_cypher(
-        cypher_pattern: str,
-        path: str = ".",
-        max_results: int = 10,
+        cypher_pattern: Annotated[
+            str,
+            Field(description="A Cypher-100 pattern with optional wildcards (*). Format: DOM:ACT_OBJ--PAT. Examples: 'SEC:VAL_*--SYN' (all sync security validation), 'NET:SND_*--ASY' (all async network send), 'DAT:*_*--*' (all data-domain functions). Use wildcards (*) for any slot you're unsure about.")
+        ],
+        path: Annotated[
+            str,
+            Field(default=".", description="Root directory path whose Symdex index to search. Defaults to current working directory ('.'). The index must exist at <path>/.symdex/index.db.")
+        ] = ".",
+        max_results: Annotated[
+            int | None,
+            Field(default=None, description="Maximum number of results to return. If None, uses default from config (typically 10). This is faster than search_codebase since it skips LLM translation.")
+        ] = None,
     ) -> str:
         """Find code segments matching a Cypher-100 pattern directly.
 
         Use this when you already know the structured fingerprint, e.g.
         'SEC:VAL_*--SYN' to find all synchronous security validation
-        functions.
+        functions. This is faster than search_codebase since it skips
+        LLM translation.
 
-        Args:
-            cypher_pattern: A Cypher pattern with optional wildcards (*).
-            path: Root directory whose index to search.
-            max_results: Maximum hits to return.
+        **When to use this tool:**
+        - You already know the Cypher pattern structure
+        - You want deterministic, fast pattern matching (no LLM calls)
+        - You're exploring a specific domain (e.g., all SEC functions)
+
+        **Learn Cypher patterns:** Read the symdex://schema/full resource
+        to understand valid domain/action/pattern codes.
 
         Returns:
             JSON array of matching functions.
         """
         from symdex.core.search import CypherSearchEngine, ResultFormatter
 
+        n = max_results if max_results is not None else cfg.default_max_search_results
         cache_dir = _resolve_cache(path)
         engine = CypherSearchEngine(cache_dir, config=cfg)
         results = engine.search(
-            cypher_pattern, strategy="direct", max_results=max_results,
+            cypher_pattern, strategy="direct", max_results=n,
         )
         return ResultFormatter.format_json(results)
 
@@ -149,17 +196,30 @@ def create_server(config: SymdexConfig | None = None):
 
     @mcp.tool()
     def index_directory(
-        path: str = ".",
-        force: bool = False,
+        path: Annotated[
+            str,
+            Field(default=".", description="Directory path to index. Defaults to current working directory ('.'). All supported source files in this directory and subdirectories will be scanned and indexed.")
+        ] = ".",
+        force: Annotated[
+            bool,
+            Field(default=False, description="If True, re-index all files even if they haven't changed (ignores hash cache). Use when you suspect the index is stale or after major refactoring. Default False only indexes changed files.")
+        ] = False,
     ) -> str:
         """Index all supported source files in a directory and build a
         sidecar search index in ``.symdex/``.
 
-        Source files are **never** modified.
+        Source files are **never** modified. The index is stored in
+        ``<path>/.symdex/index.db``.
 
-        Args:
-            path: Directory to index.
-            force: If True, re-index even unchanged files.
+        **When to use this tool:**
+        - get_index_stats shows 0 indexed files
+        - You've added new source files
+        - You've made significant code changes and want to refresh the index
+        - This is the first time indexing this codebase
+
+        **When NOT needed:**
+        - The index already exists and is up-to-date
+        - You're only searching (use search_codebase instead)
 
         Returns:
             JSON summary with counts of files scanned, functions indexed,
@@ -192,11 +252,16 @@ def create_server(config: SymdexConfig | None = None):
     # ==================================================================
 
     @mcp.tool()
-    def get_index_stats(path: str = ".") -> str:
+    def get_index_stats(
+        path: Annotated[
+            str,
+            Field(default=".", description="Root directory path whose Symdex index to inspect. Defaults to current working directory ('.'). Checks for index at <path>/.symdex/index.db.")
+        ] = ".",
+    ) -> str:
         """Return statistics about the Symdex index for a directory.
 
-        Args:
-            path: Root directory whose index to inspect.
+        **Use this first** before searching to verify an index exists.
+        If indexed_files is 0, call index_directory first.
 
         Returns:
             JSON with indexed_files and indexed_functions counts.
@@ -218,7 +283,7 @@ def create_server(config: SymdexConfig | None = None):
         """
         return json.dumps({
             "status": "ok",
-            "version": "1.1.0",
+            "version": "1.1.1",
             "provider": cfg.llm_provider,
             "model": cfg.get_model(),
         })
@@ -288,12 +353,36 @@ def create_server(config: SymdexConfig | None = None):
             "gaps or areas that might need attention."
         )
 
+    @mcp.prompt()
+    def when_to_use_symdex() -> str:
+        """Guidance prompt: explains when and how AI agents should use Symdex tools."""
+        return (
+            "**When to use Symdex tools:**\n"
+            "1. Finding code by intent (e.g., 'where do we validate passwords') - use search_codebase\n"
+            "2. Reducing context window usage - instead of reading 10 files, get 1-3 precise hits\n"
+            "3. Understanding codebase structure - use get_index_stats, then search by domain\n"
+            "4. You'd otherwise read 3+ files to find a function\n"
+            "\n"
+            "**When NOT to use Symdex:**\n"
+            "1. You already know the exact file and line - just read it directly\n"
+            "2. Searching for specific strings/identifiers - use grep/IDE search instead\n"
+            "3. Project hasn't been indexed - call index_directory first\n"
+            "4. Very small codebases (<50 functions) - indexing overhead outweighs benefits\n"
+            "\n"
+            "**Workflow:**\n"
+            "1. Check: get_index_stats('.') - verify index exists\n"
+            "2. If needed: index_directory('.') - create/update index\n"
+            "3. Search: search_codebase('your query', context_lines=3) - exploration\n"
+            "4. Edit: search_codebase('your query', context_lines=15) - more context for editing\n"
+            "5. Read: Open the top result's file at the specific line\n"
+        )
+
     return mcp
 
 
 # Server card JSON for Smithery scanning (https://smithery.ai/docs/build/external#server-scanning)
 SERVER_CARD = {
-    "serverInfo": {"name": "Symdex-100", "version": "1.1.0"},
+    "serverInfo": {"name": "Symdex-100", "version": "1.1.1"},
     "authentication": {"required": False, "schemes": []},
     "tools": [
         {"name": "search_codebase", "description": "Search the Symdex index by natural-language or Cypher pattern.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
@@ -312,6 +401,7 @@ SERVER_CARD = {
         {"name": "find_security_functions", "description": "Find all security-related functions"},
         {"name": "audit_domain", "description": "Audit all functions in a domain"},
         {"name": "explore_codebase", "description": "High-level codebase overview"},
+        {"name": "when_to_use_symdex", "description": "Guidance on when and how AI agents should use Symdex tools"},
     ],
 }
 

@@ -2,12 +2,12 @@
 
 ## System Overview
 
-Symdex-100 is a semantic code indexing and search system that achieves 100x faster code search through LLM-generated structured metadata ("Cyphers"). The system consists of three layers: **Core** (analysis, caching, generation), **Pipelines** (indexing, search), and **Interfaces** (CLI, Python API, MCP server).
+Symdex-100 is a semantic code indexing and search system that aims for roughly 50–100x faster **index lookups** (DB-only) through LLM-generated structured metadata ("Cyphers"). The system consists of three layers: **Core** (analysis, caching, generation), **Pipelines** (indexing, search), and **Interfaces** (CLI, Python API, MCP server).
 
 ## Core Design Principles
 
 ### 1. **Speed Through Reduction**
-Instead of searching 2KB of code per function, we search 20 bytes of metadata. This 100:1 reduction is the primary source of performance gains.
+Instead of searching ~2KB of code per function, we search ~20–40 bytes of metadata (a Cypher string, sometimes with compound OBJ like `RELATIONSHIPS+AUDIT`). This roughly **50–100:1** reduction is the primary source of performance gains.
 
 ### 2. **Reproducibility**
 By using temperature=0.0 for LLM calls and providing a strict schema, we ensure the same code always generates the same Cypher. This is critical for consistent search results.
@@ -115,7 +115,7 @@ src/symdex/
 - **Instance-based config as primary**: `SymdexConfig` carries all settings per-client. No global mutation.
 - **Environment variables for secrets**: API keys via `os.getenv()`, never hardcoded.
 - **Closed vocabulary**: Fixed lists for DOM/ACT/PAT ensure reproducibility.
-- **Open vocabulary for OBJ**: 2–20 uppercase letters/digits. Common objects defined in `COMMON_OBJECT_CODES` (preferred), but the LLM can generate project-specific tokens.
+- **Open vocabulary for OBJ**: OBJ can be a single token or compound (`OBJ`, `OBJ1+OBJ2`, `OBJ1+OBJ2+OBJ3`). Each part is 2–20 uppercase letters/digits. Common objects are defined in `COMMON_OBJECT_CODES` (preferred), but the LLM can generate project-specific tokens when needed.
 - **No import-time side effects**: Importing `config.py` does not validate keys or configure logging.
 
 ### 2. Core Engine (`core/engine.py`)
@@ -187,11 +187,11 @@ cypher_index:
 
 **Validation**:
 ```
-Pattern: ^[A-Z]{2,3}:[A-Z]{3}_[A-Z0-9]{2,20}--[A-Z]{3}$
+Pattern: ^[A-Z]{2,3}:[A-Z]{3}_[A-Z0-9]{2,20}(?:\+[A-Z0-9]{2,20}){0,2}--[A-Z]{3}$
 
 DOM: 2-3 uppercase letters (SEC, DAT, UI, ...)
 ACT: 3 uppercase letters   (VAL, FET, TRN, ...)
-OBJ: 2-20 uppercase letters/digits (USER, TOKEN, HTTPREQ, B64, ...)
+OBJ: 2-20 uppercase letters/digits per part; 1–3 parts joined by '+' (e.g. USER, RECORD+INDEX, RELATIONSHIPS+AUDIT)
 PAT: 3 uppercase letters   (ASY, SYN, REC, ...)
 ```
 
@@ -248,6 +248,20 @@ Each provider accepts `api_key` and `model` at construction. The `complete(syste
 #### 3.3 Incremental Indexing
 
 SHA256 hash tracking skips unchanged files. On re-run, 90%+ of files are skipped. The `--force` flag bypasses hash checks.
+
+#### 3.4 IndexResult Summary (v1.1)
+
+After indexing completes, `IndexResult` now includes a `summary` field with:
+- **`top_files`**: Top 5 files by function count (useful for identifying core modules)
+- **`domain_distribution`**: Function count per domain (e.g., `{'SEC': 23, 'DAT': 18, 'NET': 6}`)
+
+Example:
+```python
+result = client.index("./project")
+print(result.summary)
+# {'top_files': [{'file': '/project/auth.py', 'functions': 47}],
+#  'domain_distribution': {'SEC': 23, 'DAT': 18}}
+```
 
 ### 4. Search Pipeline (`core/search.py`)
 
@@ -308,7 +322,28 @@ WEIGHTS = {
 
 Scoring includes exact word overlap and substring matching against function names, with stop-word filtering. Results are sorted by score descending; the tight Cypher pattern is used so that exact and slot matches rank above broad-pattern-only hits.
 
-#### 4.4 Result Formatting
+#### 4.5 New Search Parameters (v1.1)
+
+**`context_lines` (default: 3):**
+- Controls how many lines of code are extracted for each search result
+- **Low (3-5):** Quick preview for exploration, minimal tokens
+- **Medium (8-12):** Balanced for code review tasks
+- **High (15-20):** Full function context for editing tasks
+- Example: `client.search("validate token", context_lines=15)`
+
+**`explain` (default: False):**
+- When `True`, returns scoring breakdown in `SearchResult.explanation` field
+- Useful for debugging why a function ranked high/low
+- Example output: `{'action_match': 6.0, 'object_match': 5.0, 'name_matches': {'exact': 1, 'substring': 0, 'score': 3.0}}`
+- Zero overhead when disabled (default)
+
+**`strategy` options:**
+- `'auto'` (default): LLM if available, else keyword fallback
+- `'llm'`: Force LLM translation (best accuracy, ~200-500ms)
+- `'keyword'`: Rule-based translation (fast, offline-capable, ~5ms)
+- `'direct'`: Skip translation (query is already a Cypher pattern)
+
+#### 4.6 Result Formatting
 
 `ResultFormatter` supports four output modes:
 
