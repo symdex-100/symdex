@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -62,8 +63,16 @@ def create_server(config: SymdexConfig | None = None):
     mcp = FastMCP("Symdex-100")
 
     # ==================================================================
-    # Helper — resolve cache path with proper error handling
+    # Helpers — path resolution (SYMDEX_DEFAULT_PATH for Docker mount)
     # ==================================================================
+
+    def _resolve_path(path: str) -> str:
+        """When path is '.', use SYMDEX_DEFAULT_PATH if set (e.g. /data in Docker)."""
+        if path == ".":
+            default = os.environ.get("SYMDEX_DEFAULT_PATH", "").strip()
+            if default:
+                return default
+        return path
 
     def _resolve_cache(path: str) -> Path:
         """Resolve the .symdex cache directory and verify the DB exists.
@@ -71,6 +80,7 @@ def create_server(config: SymdexConfig | None = None):
         Raises ``FileNotFoundError`` (caught by FastMCP as a tool error)
         when no index is found.
         """
+        path = _resolve_path(path)
         cache_dir = Path(path).resolve() / cfg.symdex_dir
         db = cfg.get_cache_path(cache_dir)
         if not db.exists():
@@ -80,6 +90,16 @@ def create_server(config: SymdexConfig | None = None):
             )
         return cache_dir
 
+    def _norm_str_list(v: Any) -> list[str] | None:
+        """Normalise domain_filter/action_filter so client sending string or odd shape doesn't break JSON."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [v.strip()] if v.strip() else None
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return None
+
     # ==================================================================
     # Tool: search_codebase
     # ==================================================================
@@ -88,8 +108,8 @@ def create_server(config: SymdexConfig | None = None):
     def search_codebase(
         query: Annotated[
             str,
-            Field(description="Natural-language query (e.g., 'validate user tokens') or Cypher pattern (e.g., 'SEC:VAL_TOKEN--*'). Use natural language for intent-based search; use Cypher patterns when you know the exact semantic fingerprint structure.")
-        ],
+            Field(default="", description="Natural-language query (e.g., 'validate user tokens') or Cypher pattern (e.g., 'SEC:VAL_TOKEN--*'). Use natural language for intent-based search; use Cypher patterns when you know the exact semantic fingerprint structure. Required for meaningful results.")
+        ] = "",
         path: Annotated[
             str,
             Field(default=".", description="Root directory path whose Symdex index to search. Defaults to current working directory ('.'). The index must exist at <path>/.symdex/index.db.")
@@ -110,6 +130,22 @@ def create_server(config: SymdexConfig | None = None):
             bool | None,
             Field(default=None, description="If True, exclude test functions from results. If None, uses config default (typically True, excluding tests). Set to False to include test code in search results.")
         ] = None,
+        directory_scope: Annotated[
+            str | None,
+            Field(default=None, description="If set, restrict results to functions under this path (relative to index root). Use when the index is at repo root but you want only a subtree (e.g. 'src/auditor').")
+        ] = None,
+        domain_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only results whose Cypher domain is in this list (e.g. ['BIZ', 'NET']).")
+        ] = None,
+        action_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only results whose Cypher action is in this list (e.g. ['FET', 'SND']).")
+        ] = None,
+        group_by: Annotated[
+            str | None,
+            Field(default=None, description="If 'domain' or 'action', return results grouped by Cypher domain or action (e.g. {'by_domain': {'BIZ': [...], 'NET': [...]}}).")
+        ] = None,
     ) -> str:
         """Search the Symdex index for functions matching a natural-language
         query or a Cypher pattern (e.g. 'SEC:VAL_TOKEN--*').
@@ -128,20 +164,36 @@ def create_server(config: SymdexConfig | None = None):
         - You're searching for a specific string/identifier (use grep/IDE search instead)
         - The project hasn't been indexed (call index_directory first)
 
+        **Path vs directory_scope:** path must be the index root (where .symdex/index.db lives).
+        Use directory_scope to restrict results to a subtree (e.g. 'django/auditor').
+
         Returns:
             JSON array of matching functions with file, line, cypher,
-            score, and a short code preview.
+            score, and a short code preview (or grouped object if group_by is set).
         """
-        from symdex.core.search import CypherSearchEngine, ResultFormatter
+        try:
+            from symdex.core.search import CypherSearchEngine, ResultFormatter
 
-        n = max_results if max_results is not None else cfg.default_max_search_results
-        ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
-        no_tests = exclude_tests if exclude_tests is not None else cfg.default_exclude_tests
+            query = str(query).strip() if query is not None else ""
+            if not query:
+                return json.dumps({"error": "Missing required argument: query", "results": []}, allow_nan=False)
 
-        cache_dir = _resolve_cache(path)
-        engine = CypherSearchEngine(cache_dir, config=cfg)
-        results = engine.search(query, strategy=strategy, max_results=n, context_lines=ctx_lines, exclude_tests=no_tests)
-        return ResultFormatter.format_json(results)
+            n = max_results if max_results is not None else cfg.default_max_search_results
+            ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+            no_tests = exclude_tests if exclude_tests is not None else cfg.default_exclude_tests
+            domain_filter = _norm_str_list(domain_filter)
+            action_filter = _norm_str_list(action_filter)
+
+            cache_dir = _resolve_cache(path)
+            engine = CypherSearchEngine(cache_dir, config=cfg)
+            results = engine.search(
+                query, strategy=strategy, max_results=n, context_lines=ctx_lines,
+                exclude_tests=no_tests, directory_scope=directory_scope,
+                domain_filter=domain_filter, action_filter=action_filter,
+            )
+            return ResultFormatter.format_json(results, group_by=group_by)
+        except Exception as e:
+            return json.dumps({"error": str(e), "results": []}, allow_nan=False)
 
     # ==================================================================
     # Tool: search_by_cypher
@@ -160,6 +212,18 @@ def create_server(config: SymdexConfig | None = None):
         max_results: Annotated[
             int | None,
             Field(default=None, description="Maximum number of results to return. If None, uses default from config (typically 10). This is faster than search_codebase since it skips LLM translation.")
+        ] = None,
+        directory_scope: Annotated[
+            str | None,
+            Field(default=None, description="If set, restrict results to functions under this path (relative to index root).")
+        ] = None,
+        domain_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only results whose Cypher domain is in this list.")
+        ] = None,
+        action_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only results whose Cypher action is in this list.")
         ] = None,
     ) -> str:
         """Find code segments matching a Cypher-100 pattern directly.
@@ -183,10 +247,14 @@ def create_server(config: SymdexConfig | None = None):
         from symdex.core.search import CypherSearchEngine, ResultFormatter
 
         n = max_results if max_results is not None else cfg.default_max_search_results
+        domain_filter = _norm_str_list(domain_filter)
+        action_filter = _norm_str_list(action_filter)
         cache_dir = _resolve_cache(path)
         engine = CypherSearchEngine(cache_dir, config=cfg)
         results = engine.search(
             cypher_pattern, strategy="direct", max_results=n,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
         )
         return ResultFormatter.format_json(results)
 
@@ -227,6 +295,7 @@ def create_server(config: SymdexConfig | None = None):
         """
         from symdex.core.indexer import IndexingPipeline
 
+        path = _resolve_path(path)
         root = Path(path).resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"'{path}' is not a directory.")
@@ -283,7 +352,7 @@ def create_server(config: SymdexConfig | None = None):
         """
         return json.dumps({
             "status": "ok",
-            "version": "1.2.0",
+            "version": "1.2.1",
             "provider": cfg.llm_provider,
             "model": cfg.get_model(),
         })
@@ -395,12 +464,29 @@ def create_server(config: SymdexConfig | None = None):
             int | None,
             Field(default=None, description="Number of lines of code context to include per result. Default uses config (typically 3).")
         ] = None,
+        directory_scope: Annotated[
+            str | None,
+            Field(default=None, description="If set, restrict to callers under this path (relative to index root).")
+        ] = None,
+        domain_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only callers whose Cypher domain is in this list.")
+        ] = None,
+        action_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only callers whose Cypher action is in this list.")
+        ] = None,
     ) -> str:
         """Find all indexed functions that call the specified function.
 
         Use this to answer **"who calls X?"** — e.g., to trace which
         functions invoke ``encrypt_file_content``, or to understand where
         a utility is used across the codebase.
+
+        **Celery / task invocations:** If the target is a Celery task
+        (e.g. ``validate_vulnerabilities_task``), callers that invoke it
+        via ``.delay()`` or ``.apply_async()`` are included in the call
+        graph (indexed as task invocations).
 
         Requires the codebase to have been indexed (call edges are
         extracted during ``index_directory``).
@@ -411,9 +497,15 @@ def create_server(config: SymdexConfig | None = None):
         from symdex.core.search import CypherSearchEngine, ResultFormatter
 
         ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        domain_filter = _norm_str_list(domain_filter)
+        action_filter = _norm_str_list(action_filter)
         cache_dir = _resolve_cache(path)
         engine = CypherSearchEngine(cache_dir, config=cfg)
-        results = engine.get_callers(function_name, context_lines=ctx_lines)
+        results = engine.get_callers(
+            function_name, context_lines=ctx_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
         return ResultFormatter.format_json(results)
 
     # ==================================================================
@@ -438,6 +530,18 @@ def create_server(config: SymdexConfig | None = None):
             int | None,
             Field(default=None, description="Number of lines of code context to include per result. Default uses config (typically 3).")
         ] = None,
+        directory_scope: Annotated[
+            str | None,
+            Field(default=None, description="If set, restrict to callees under this path.")
+        ] = None,
+        domain_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only callees whose Cypher domain is in this list.")
+        ] = None,
+        action_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only callees whose Cypher action is in this list.")
+        ] = None,
     ) -> str:
         """Find all indexed functions called by the specified function.
 
@@ -453,9 +557,15 @@ def create_server(config: SymdexConfig | None = None):
         from symdex.core.search import CypherSearchEngine, ResultFormatter
 
         ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        domain_filter = _norm_str_list(domain_filter)
+        action_filter = _norm_str_list(action_filter)
         cache_dir = _resolve_cache(path)
         engine = CypherSearchEngine(cache_dir, config=cfg)
-        results = engine.get_callees(function_name, file_path=file_path, context_lines=ctx_lines)
+        results = engine.get_callees(
+            function_name, file_path=file_path, context_lines=ctx_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
         return ResultFormatter.format_json(results)
 
     # ==================================================================
@@ -484,6 +594,18 @@ def create_server(config: SymdexConfig | None = None):
             int | None,
             Field(default=None, description="Lines of code context per result.")
         ] = None,
+        directory_scope: Annotated[
+            str | None,
+            Field(default=None, description="If set, restrict to nodes under this path.")
+        ] = None,
+        domain_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only nodes whose Cypher domain is in this list.")
+        ] = None,
+        action_filter: Annotated[
+            list[str] | None,
+            Field(default=None, description="If set, keep only nodes whose Cypher action is in this list.")
+        ] = None,
     ) -> str:
         """Trace the call chain from a function, walking up (callers) or down (callees).
 
@@ -503,11 +625,15 @@ def create_server(config: SymdexConfig | None = None):
         from symdex.core.search import CypherSearchEngine
 
         ctx_lines = context_lines if context_lines is not None else cfg.default_context_lines
+        domain_filter = _norm_str_list(domain_filter)
+        action_filter = _norm_str_list(action_filter)
         cache_dir = _resolve_cache(path)
         engine = CypherSearchEngine(cache_dir, config=cfg)
         chain = engine.trace_call_chain(
             function_name, direction=direction,
             max_depth=max_depth, context_lines=ctx_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
         )
 
         return json.dumps({
@@ -515,24 +641,24 @@ def create_server(config: SymdexConfig | None = None):
             "direction": direction,
             "max_depth": max_depth,
             "chain": chain,
-        }, indent=2)
+        }, indent=2, allow_nan=False)
 
     return mcp
 
 
 # Server card JSON for Smithery scanning (https://smithery.ai/docs/build/external#server-scanning)
 SERVER_CARD = {
-    "serverInfo": {"name": "Symdex-100", "version": "1.2.0"},
+    "serverInfo": {"name": "Symdex-100", "version": "1.2.1"},
     "authentication": {"required": False, "schemes": []},
     "tools": [
-        {"name": "search_codebase", "description": "Search the Symdex index by natural-language or Cypher pattern.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
-        {"name": "search_by_cypher", "description": "Find code matching a Cypher-100 pattern (no LLM).", "inputSchema": {"type": "object", "properties": {"cypher_pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}}},
+        {"name": "search_codebase", "description": "Search by natural-language or Cypher. Optional: directory_scope (subtree), domain_filter, action_filter, group_by (domain|action).", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
+        {"name": "search_by_cypher", "description": "Find code by Cypher pattern (no LLM). Optional: directory_scope, domain_filter, action_filter.", "inputSchema": {"type": "object", "properties": {"cypher_pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}}},
         {"name": "index_directory", "description": "Index source files into .symdex/ sidecar.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}}}},
         {"name": "get_index_stats", "description": "Return index statistics for a directory.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
         {"name": "health", "description": "Server readiness check.", "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "get_callers", "description": "Find functions that call a given function (call graph).", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
-        {"name": "get_callees", "description": "Find functions called by a given function (call graph).", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "file_path": {"type": "string"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
-        {"name": "trace_call_chain", "description": "Recursively trace the call chain (callers or callees) from a function.", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "direction": {"type": "string"}, "max_depth": {"type": "integer"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
+        {"name": "get_callers", "description": "Find who calls a function (call graph). Includes Celery .delay()/.apply_async(). Optional: directory_scope, domain_filter, action_filter.", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
+        {"name": "get_callees", "description": "Find what a function calls (call graph). Optional: directory_scope, domain_filter, action_filter.", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "file_path": {"type": "string"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
+        {"name": "trace_call_chain", "description": "Trace call chain (callers or callees). Optional: directory_scope, domain_filter, action_filter.", "inputSchema": {"type": "object", "properties": {"function_name": {"type": "string"}, "path": {"type": "string"}, "direction": {"type": "string"}, "max_depth": {"type": "integer"}, "context_lines": {"type": "integer"}}, "required": ["function_name"]}},
     ],
     "resources": [
         {"uri": "symdex://schema/domains", "description": "Cypher domain codes"},

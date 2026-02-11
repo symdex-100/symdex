@@ -26,7 +26,7 @@ Configuration override::
     client = Symdex(config=config)
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # Primary public API — the Symdex facade
 from symdex.client import Symdex

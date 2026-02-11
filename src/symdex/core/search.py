@@ -15,7 +15,8 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
+
 import re
 
 from symdex.core.config import Config, CypherSchema, SymdexConfig
@@ -25,6 +26,44 @@ from symdex.core.engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _cypher_domain(cypher: str) -> str:
+    """Extract domain (DOM) from Cypher string, e.g. 'BIZ:SYN_TASK--SYN' -> 'BIZ'."""
+    if ":" in cypher:
+        return cypher.split(":")[0].strip()
+    return ""
+
+
+def _cypher_action(cypher: str) -> str:
+    """Extract action (ACT) from Cypher string, e.g. 'BIZ:SYN_TASK--SYN' -> 'SYN'."""
+    if ":" in cypher:
+        rest = cypher.split(":", 1)[1]
+        if "--" in rest:
+            act_obj = rest.split("--", 1)[0]
+            if "_" in act_obj:
+                return act_obj.split("_", 1)[0].strip()
+    return ""
+
+
+def _filter_by_domain_action(
+    results: List[SearchResult],
+    domain_filter: Optional[List[str]] = None,
+    action_filter: Optional[List[str]] = None,
+) -> List[SearchResult]:
+    """Keep only results whose Cypher domain/action is in the given sets (if provided)."""
+    if not domain_filter and not action_filter:
+        return results
+    domains = set(d.upper() for d in (domain_filter or []))
+    actions = set(a.upper() for a in (action_filter or []))
+    out: List[SearchResult] = []
+    for r in results:
+        if domains and _cypher_domain(r.cypher) not in domains:
+            continue
+        if actions and _cypher_action(r.cypher) not in actions:
+            continue
+        out.append(r)
+    return out
 
 
 # =============================================================================
@@ -91,7 +130,10 @@ class CypherSearchEngine:
 
     def search(self, query: str, strategy: str = "auto",
                max_results: int = None, context_lines: int = 3,
-               explain: bool = False, exclude_tests: bool = True) -> List[SearchResult]:
+               explain: bool = False, exclude_tests: bool = True,
+               directory_scope: Optional[str] = None,
+               domain_filter: Optional[List[str]] = None,
+               action_filter: Optional[List[str]] = None) -> List[SearchResult]:
         """
         Execute a search query using the specified strategy.
 
@@ -102,6 +144,9 @@ class CypherSearchEngine:
             context_lines: Lines of code context per result (default 3; increase for editing).
             explain: Include scoring breakdown in results (for debugging).
             exclude_tests: If True, filter out test functions (default True for normal use).
+            directory_scope: If set, restrict results to functions under this path (relative to index root).
+            domain_filter: If set, keep only results whose Cypher domain is in this list (e.g. ['BIZ', 'NET']).
+            action_filter: If set, keep only results whose Cypher action is in this list (e.g. ['FET', 'SND']).
 
         Returns:
             Ranked list of search results.
@@ -127,12 +172,13 @@ class CypherSearchEngine:
         # Time only DB + scoring + context (exclude LLM/keyword translation)
         t0 = time.perf_counter()
         if len(patterns) > 1:
-            raw_results = self._tiered_multi_lane_search(query, patterns, max_results)
+            raw_results = self._tiered_multi_lane_search(query, patterns, max_results, directory_scope=directory_scope)
         else:
             # When query is a Cypher pattern (e.g. from search_by_cypher), only use Cypher lanes
             cypher_only = query.strip() == primary_pattern.strip()
             raw_results = self._multi_lane_search(
-                query, primary_pattern, max_results, cypher_only=cypher_only
+                query, primary_pattern, max_results, cypher_only=cypher_only,
+                directory_scope=directory_scope,
             )
 
         # Score against the tight (primary) pattern so precise matches rank highest
@@ -141,6 +187,9 @@ class CypherSearchEngine:
         # Filter tests if requested
         if exclude_tests:
             search_results = [r for r in search_results if not r.is_test]
+
+        # Apply domain/action filters
+        search_results = _filter_by_domain_action(search_results, domain_filter=domain_filter, action_filter=action_filter)
         
         search_results.sort()
         self._last_db_elapsed_seconds = time.perf_counter() - t0
@@ -220,7 +269,8 @@ class CypherSearchEngine:
     # ── Multi-lane retrieval ──────────────────────────────────────
 
     def _tiered_multi_lane_search(
-        self, query: str, patterns: List[str], max_results: int
+        self, query: str, patterns: List[str], max_results: int,
+        directory_scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Run multi-lane search for each pattern in order (tight → medium → broad),
@@ -232,7 +282,10 @@ class CypherSearchEngine:
         threshold = max_results * 2
 
         for cypher_pattern in patterns:
-            raw = self._multi_lane_search(query, cypher_pattern, max_results)
+            raw = self._multi_lane_search(
+                query, cypher_pattern, max_results,
+                directory_scope=directory_scope,
+            )
             for r in raw:
                 key = (r["file_path"], r["function_name"], r.get("line_start", 0))
                 if key not in seen:
@@ -245,22 +298,16 @@ class CypherSearchEngine:
 
     def _multi_lane_search(self, query: str, cypher_pattern: str,
                            max_results: int,
-                           cypher_only: bool = False) -> List[Dict[str, Any]]:
+                           cypher_only: bool = False,
+                           directory_scope: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Multi-lane search; merges unique results for unified ranking.
-
-        Lanes:
-          1. Exact Cypher pattern       — highest precision
-          2. Domain-wildcarded Cypher   — cross-domain recall
-          3. Action-only Cypher         — broadest Cypher recall
-          4. Tag keyword search         — semantic tags (skipped if cypher_only)
-          5. Function name search       — literal name matching (skipped if cypher_only)
-
-        When cypher_only is True (e.g. from search_by_cypher), only lanes 1–3
-        run so results are strictly Cypher-pattern matches.
+        When directory_scope is set, only functions under that path are returned.
         """
         fetch_limit = max(max_results * 5, 30)
         fetch_limit_tag = min(fetch_limit, 50)
+        path_prefix = (directory_scope or "").strip() or None
+        keywords: List[str] = []
 
         seen: set = set()
         merged: List[Dict[str, Any]] = []
@@ -275,7 +322,7 @@ class CypherSearchEngine:
                     merged.append(r)
 
         # ── Lane 1: Exact Cypher pattern ─────────────────────────
-        _add(self.cache.search_by_cypher(cypher_pattern, limit=fetch_limit))
+        _add(self.cache.search_by_cypher(cypher_pattern, limit=fetch_limit, path_prefix=path_prefix))
 
         # ── Lane 2: Domain-wildcarded (same ACT_OBJ--PAT) ───────
         parts = cypher_pattern.split(":")
@@ -284,7 +331,7 @@ class CypherSearchEngine:
             # Skip when rest is fully wildcard (*_*--*) or we'd match the whole index
             if dom != "*" and rest_str.strip() != "*_*--*":
                 _add(self.cache.search_by_cypher(
-                    f"*:{rest_str}", limit=fetch_limit
+                    f"*:{rest_str}", limit=fetch_limit, path_prefix=path_prefix
                 ))
         else:
             rest_str = cypher_pattern
@@ -298,21 +345,20 @@ class CypherSearchEngine:
                 pat = rest[1]
                 if act != "*" and (obj != "*" or pat != "*"):
                     _add(self.cache.search_by_cypher(
-                        f"*:{act}_*--*", limit=fetch_limit
+                        f"*:{act}_*--*", limit=fetch_limit, path_prefix=path_prefix
                     ))
 
         if cypher_only:
-            keywords = []
             logger.debug("Direct Cypher search: tag/name lanes skipped")
         else:
             # ── Lane 4: Tag keyword search ───────────────────────────
             keywords = self._extract_keywords(query)
             for kw in keywords[:5]:
-                _add(self.cache.search_by_tags(kw, limit=fetch_limit_tag))
+                _add(self.cache.search_by_tags(kw, limit=fetch_limit_tag, path_prefix=path_prefix))
 
             # ── Lane 5: Function name search ─────────────────────────
             if keywords:
-                _add(self.cache.search_by_name(keywords, limit=fetch_limit_tag))
+                _add(self.cache.search_by_name(keywords, limit=fetch_limit_tag, path_prefix=path_prefix))
 
         # Cap total candidates to avoid scoring huge sets
         cap = self._config.max_search_candidates or (max_results * 10)
@@ -513,21 +559,32 @@ class CypherSearchEngine:
     
     # ── Call Graph ────────────────────────────────────────────────
 
-    def get_callers(self, function_name: str, context_lines: int = 3) -> List[SearchResult]:
+    def get_callers(self, function_name: str, context_lines: int = 3,
+                    directory_scope: Optional[str] = None,
+                    domain_filter: Optional[List[str]] = None,
+                    action_filter: Optional[List[str]] = None) -> List[SearchResult]:
         """Find indexed functions that call *function_name*.
 
         Args:
             function_name: Name of the target function.
             context_lines: Lines of code context per result.
+            directory_scope: If set, restrict to callers under this path.
+            domain_filter: If set, keep only callers whose Cypher domain is in this list.
+            action_filter: If set, keep only callers whose Cypher action is in this list.
 
         Returns:
             List of :class:`SearchResult` objects for each caller, with context.
         """
-        raw_results = self.cache.get_callers(function_name)
-        return self._process_call_graph_results(raw_results, context_lines)
+        path_prefix = (directory_scope or "").strip() or None
+        raw_results = self.cache.get_callers(function_name, path_prefix=path_prefix)
+        results = self._process_call_graph_results(raw_results, context_lines)
+        return _filter_by_domain_action(results, domain_filter=domain_filter, action_filter=action_filter)
 
     def get_callees(self, function_name: str, file_path: str | None = None,
-                    context_lines: int = 3) -> List[SearchResult]:
+                    context_lines: int = 3,
+                    directory_scope: Optional[str] = None,
+                    domain_filter: Optional[List[str]] = None,
+                    action_filter: Optional[List[str]] = None) -> List[SearchResult]:
         """Find indexed functions called by *function_name*.
 
         Args:
@@ -535,15 +592,23 @@ class CypherSearchEngine:
             file_path: Optional source file path to disambiguate when the
                 function name exists in multiple files.
             context_lines: Lines of code context per result.
+            directory_scope: If set, restrict to callees under this path.
+            domain_filter: If set, keep only callees whose Cypher domain is in this list.
+            action_filter: If set, keep only callees whose Cypher action is in this list.
 
         Returns:
             List of :class:`SearchResult` objects for each callee, with context.
         """
-        raw_results = self.cache.get_callees(function_name, caller_file=file_path)
-        return self._process_call_graph_results(raw_results, context_lines)
+        path_prefix = (directory_scope or "").strip() or None
+        raw_results = self.cache.get_callees(function_name, caller_file=file_path, path_prefix=path_prefix)
+        results = self._process_call_graph_results(raw_results, context_lines)
+        return _filter_by_domain_action(results, domain_filter=domain_filter, action_filter=action_filter)
 
     def trace_call_chain(self, function_name: str, direction: str = "callers",
-                         max_depth: int = 5, context_lines: int = 3) -> List[Dict[str, Any]]:
+                         max_depth: int = 5, context_lines: int = 3,
+                         directory_scope: Optional[str] = None,
+                         domain_filter: Optional[List[str]] = None,
+                         action_filter: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Walk the call graph recursively from a starting function.
 
         Args:
@@ -552,6 +617,9 @@ class CypherSearchEngine:
                 ``'callees'`` (what this calls — walk down).
             max_depth: Maximum recursion depth (default 5).
             context_lines: Lines of code context per node.
+            directory_scope: If set, restrict to nodes under this path.
+            domain_filter: If set, keep only nodes whose Cypher domain is in this list.
+            action_filter: If set, keep only nodes whose Cypher action is in this list.
 
         Returns:
             Flat list of dicts, each with function info and a ``depth`` field.
@@ -564,6 +632,9 @@ class CypherSearchEngine:
         self._walk_call_graph(
             function_name, direction, 1, max_depth,
             visited, chain, context_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter,
+            action_filter=action_filter,
         )
 
         return chain
@@ -571,15 +642,22 @@ class CypherSearchEngine:
     def _walk_call_graph(self, function_name: str, direction: str,
                          current_depth: int, max_depth: int,
                          visited: set, chain: List[Dict[str, Any]],
-                         context_lines: int) -> None:
+                         context_lines: int,
+                         directory_scope: Optional[str] = None,
+                         domain_filter: Optional[List[str]] = None,
+                         action_filter: Optional[List[str]] = None) -> None:
         """Recursive DFS helper for :meth:`trace_call_chain`."""
         if current_depth > max_depth:
             return
 
+        path_prefix = (directory_scope or "").strip() or None
         if direction == "callers":
-            raw = self.cache.get_callers(function_name)
+            raw = self.cache.get_callers(function_name, path_prefix=path_prefix)
         else:
-            raw = self.cache.get_callees(function_name)
+            raw = self.cache.get_callees(function_name, path_prefix=path_prefix)
+
+        domains = set(d.upper() for d in (domain_filter or []))
+        actions = set(a.upper() for a in (action_filter or []))
 
         for row in raw:
             fname = row.get("function_name", "")
@@ -591,24 +669,48 @@ class CypherSearchEngine:
 
             # Build a SearchResult with context
             results = self._process_call_graph_results([row], context_lines)
-            if results:
-                r = results[0]
-                chain.append({
-                    "function_name": r.function_name,
-                    "file_path": r.file_path,
-                    "line_start": r.line_start,
-                    "line_end": r.line_end,
-                    "cypher": r.cypher,
-                    "depth": current_depth,
-                    "context": r.context,
-                    "path_root": r.path_root,
-                })
-
-                # Recurse into next level
+            if not results:
+                continue
+            r = results[0]
+            # Apply domain/action filter: skip adding to chain if filters set and node doesn't pass
+            if domains and _cypher_domain(r.cypher) not in domains:
                 self._walk_call_graph(
                     fname, direction, current_depth + 1, max_depth,
                     visited, chain, context_lines,
+                    directory_scope=directory_scope,
+                    domain_filter=domain_filter,
+                    action_filter=action_filter,
                 )
+                continue
+            if actions and _cypher_action(r.cypher) not in actions:
+                self._walk_call_graph(
+                    fname, direction, current_depth + 1, max_depth,
+                    visited, chain, context_lines,
+                    directory_scope=directory_scope,
+                    domain_filter=domain_filter,
+                    action_filter=action_filter,
+                )
+                continue
+
+            chain.append({
+                "function_name": r.function_name,
+                "file_path": ResultFormatter._sanitize_for_json(r.file_path),
+                "line_start": r.line_start,
+                "line_end": r.line_end,
+                "cypher": r.cypher,
+                "depth": current_depth,
+                "context": ResultFormatter._sanitize_for_json(r.context or ""),
+                "path_root": ResultFormatter._sanitize_for_json(r.path_root or ""),
+            })
+
+            # Recurse into next level
+            self._walk_call_graph(
+                fname, direction, current_depth + 1, max_depth,
+                visited, chain, context_lines,
+                directory_scope=directory_scope,
+                domain_filter=domain_filter,
+                action_filter=action_filter,
+            )
 
     def _process_call_graph_results(self, raw_results: List[Dict[str, Any]],
                                      context_lines: int) -> List[SearchResult]:
@@ -767,23 +869,50 @@ class ResultFormatter:
     # ── JSON ──────────────────────────────────────────────────────
 
     @staticmethod
-    def format_json(results: List[SearchResult]) -> str:
-        """Format results as JSON (full paths, all fields). Includes path_root when set."""
-        json_results = [
-            {
+    def _sanitize_for_json(s: str) -> str:
+        """Ensure string is safe for JSON (no control chars, normalise path separators for portability)."""
+        if not s:
+            return s
+        # Normalise backslashes to forward slashes so emitted JSON has no backslash in paths
+        s = s.replace("\\", "/")
+        # Remove control characters that can break strict JSON parsers
+        return "".join(c for c in s if (ord(c) >= 32 and ord(c) != 127) or c in "\n\r\t")
+
+    @staticmethod
+    def format_json(results: List[SearchResult], group_by: Optional[str] = None) -> str:
+        """Format results as JSON (full paths, all fields). Includes path_root when set.
+        When group_by is 'domain' or 'action', returns a dict grouped by Cypher domain or action.
+        Paths are normalised to forward slashes; control chars in context are stripped so output is valid JSON.
+        """
+        def _to_obj(r: SearchResult) -> dict:
+            obj = {
                 "function_name": r.function_name,
-                "file_path": r.file_path,
+                "file_path": ResultFormatter._sanitize_for_json(r.file_path),
                 "line_start": r.line_start,
                 "line_end": r.line_end,
                 "cypher": r.cypher,
                 "score": round(r.score, 2),
                 "language": ResultFormatter._detect_language(r.file_path),
-                "context": r.context,
-                **({"path_root": r.path_root} if r.path_root else {}),
+                "context": ResultFormatter._sanitize_for_json(r.context or ""),
             }
-            for r in results
-        ]
-        return json.dumps(json_results, indent=2)
+            if r.path_root:
+                obj["path_root"] = ResultFormatter._sanitize_for_json(r.path_root)
+            return obj
+
+        if group_by == "domain":
+            by_domain: Dict[str, List[dict]] = {}
+            for r in results:
+                dom = _cypher_domain(r.cypher) or "_"
+                by_domain.setdefault(dom, []).append(_to_obj(r))
+            return json.dumps({"by_domain": by_domain}, indent=2, allow_nan=False)
+        if group_by == "action":
+            by_action: Dict[str, List[dict]] = {}
+            for r in results:
+                act = _cypher_action(r.cypher) or "_"
+                by_action.setdefault(act, []).append(_to_obj(r))
+            return json.dumps({"by_action": by_action}, indent=2, allow_nan=False)
+        json_results = [_to_obj(r) for r in results]
+        return json.dumps(json_results, indent=2, allow_nan=False)
 
     # ── Compact (grep-like, one line per result) ──────────────────
 

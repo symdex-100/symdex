@@ -1,7 +1,7 @@
 {
   "serverInfo": {
     "name": "Symdex-100",
-    "version": "1.2.0"
+    "version": "1.2.1"
   },
   "authentication": {
     "required": false,

@@ -50,6 +50,20 @@ class TestCallSiteExtraction:
         assert "validate" in callee_names
         assert "transform" in callee_names
 
+    def test_celery_delay_treated_as_task_call(self):
+        """Celery task.delay() and task.apply_async() record the task as callee, not 'delay'/'apply_async'."""
+        code = (
+            "def run_validation():\n"
+            "    validate_vulnerabilities_task.delay()\n"
+            "    other_task.apply_async()\n"
+        )
+        funcs = CodeAnalyzer.extract_functions(code, "example.py")
+        callee_names = [cs.callee_name for cs in funcs[0].call_sites]
+        assert "validate_vulnerabilities_task" in callee_names
+        assert "other_task" in callee_names
+        assert "delay" not in callee_names
+        assert "apply_async" not in callee_names
+
     def test_call_sites_have_line_numbers(self):
         code = (
             "def process(data):\n"       # line 1

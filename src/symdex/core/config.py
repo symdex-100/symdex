@@ -137,13 +137,17 @@ class SymdexConfig:
                 return False
             return default
 
+        def _key_env(name: str) -> Optional[str]:
+            raw = os.getenv(name)
+            return raw.strip() if raw else None
+
         return cls(
             llm_provider=os.getenv("SYMDEX_LLM_PROVIDER", "anthropic").lower(),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            anthropic_api_key=_key_env("ANTHROPIC_API_KEY"),
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_api_key=_key_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY"),
+            gemini_api_key=_key_env("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
             llm_max_tokens=_int_env("SYMDEX_MAX_TOKENS", 300),
             min_search_score=float(os.getenv("CYPHER_MIN_SCORE", "5.0")),

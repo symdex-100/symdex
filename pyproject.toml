@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "symdex-100"
-version = "1.2.0"
+version = "1.2.1"
 description = "Semantic fingerprints for 100x faster code search. Python-focused Cypher metadata stored in sidecar index."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,7 +40,7 @@ openai = ["openai>=1.12.0"]
 gemini = ["google-genai>=1.0.0"]
 # Convenience bundles
 llm-all = ["symdex-100[anthropic,openai,gemini]"]
-mcp = ["fastmcp>=0.4.0", "cffi>=1.15.0"]
+mcp = ["fastmcp>=0.4.0", "cffi>=1.15.0", "attrs>=24.0.0"]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",

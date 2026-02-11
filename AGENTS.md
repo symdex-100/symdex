@@ -28,6 +28,11 @@ PAT = Pattern   (ASY, SYN, REC, GEN, DEC, CTX, CLS)
 **Example:** `SEC:VAL_TOKEN--ASY` means "Security domain, validates a
 token, async pattern."
 
+**Highlights for agents:**
+- **Path vs scope:** `path` is the index root (where `.symdex/index.db` lives). Use `directory_scope` to restrict results to a subtree (e.g. `"src/auditor"`) without a separate index.
+- **Celery / task callers:** Invocations like `validate_task.delay()` or `task.apply_async()` are indexed as call edges to the task; `get_callers(task_name)` finds who triggers the task.
+- **Filter by domain/action:** Use `domain_filter` and `action_filter` (e.g. `["BIZ", "NET"]`) to narrow search and call-graph results; use `group_by="domain"` or `"action"` to get results grouped in JSON.
+
 ---
 
 ## When to use Symdex
@@ -54,7 +59,7 @@ token, async pattern."
 
 6. **You need to trace execution flow** — Use `get_callers` ("who calls X?"),
    `get_callees` ("what does X call?"), or `trace_call_chain` to walk the
-   call graph without manually reading files or grepping.
+   call graph without manually reading files or grepping. **Celery (and similar) task invocations** (e.g. `validate_vulnerabilities_task.delay()`) are indexed as call edges to the task function, so "who triggers this task?" is discoverable via `get_callers(task_name)`.
 
 ### DO NOT use Symdex when:
 
@@ -72,12 +77,14 @@ token, async pattern."
 
 If Symdex is configured as an MCP server, you have these tools:
 
-### `search_codebase(query, path=".", strategy="auto", max_results=10, context_lines=3, exclude_tests=None)`
+### `search_codebase(query, path=".", strategy="auto", max_results=10, context_lines=3, exclude_tests=None, directory_scope=None, domain_filter=None, action_filter=None, group_by=None)`
 
 **Your primary tool.** Pass a natural-language query or Cypher pattern.
 
 - **Natural language:** The LLM returns **three** Cypher patterns (tight, medium, broad). The engine tries the tight pattern first and only broadens if needed, so you get fewer irrelevant results and faster, more focused hits. Results are ranked against the tight pattern.
 - **Reported time** in tool output is **DB-only** (index lookup, scoring, context); LLM translation time is not included.
+
+**Path vs directory_scope:** `path` must be the **index root** (the directory that contains `.symdex/index.db`). To restrict results to a **subtree** of the repo (e.g. only `src/auditor`), keep `path` as the repo root and set `directory_scope` to that relative path (e.g. `directory_scope="src/auditor"`). Searching with `path` set to a subdirectory that has no `.symdex/` will fail with "No Symdex index found".
 
 **Parameters you can pass explicitly (recommended when the agent needs to adapt):**
 
@@ -85,6 +92,10 @@ If Symdex is configured as an MCP server, you have these tools:
 |-----------|--------|-------------------|
 | `context_lines` | 3 (or server default) | Use **10–15** when you need to **edit** the found code (more context per result). Use **3** for quick exploration. |
 | `exclude_tests` | config default (**true**) | Set to **false** to include test code. When omitted, uses config (default: exclude tests for normal use). |
+| `directory_scope` | None | Set to a path relative to index root (e.g. `"src/step_5/vulnerability_analysis"`) to restrict results to that subtree. |
+| `domain_filter` | None | List of Cypher domains (e.g. `["BIZ", "NET"]`) to keep only matching results. |
+| `action_filter` | None | List of Cypher actions (e.g. `["FET", "SND"]`) to keep only matching results. |
+| `group_by` | None | Set to `"domain"` or `"action"` to return results grouped by Cypher domain or action. |
 
 **How an AI should create the query:**
 
@@ -113,9 +124,9 @@ search_codebase("DAT:*_*--*")  → all Data-domain functions
 
 **Returns:** JSON array of `{function_name, file_path, line_start, line_end, cypher, score, context}`.
 
-### `search_by_cypher(cypher_pattern, path=".", max_results=10)`
+### `search_by_cypher(cypher_pattern, path=".", max_results=10, directory_scope=None, domain_filter=None, action_filter=None)`
 
-Direct pattern search — no LLM translation.  Faster, deterministic.
+Direct pattern search — no LLM translation.  Faster, deterministic.  Supports `directory_scope` and Cypher domain/action filters like `search_codebase`.
 
 ```
 search_by_cypher("SEC:VAL_*--SYN")   → all sync security validation
@@ -134,28 +145,27 @@ Returns `{indexed_files, indexed_functions, call_edges}`.  Use to check if
 indexing has been done.  `call_edges` is the number of caller→callee
 relationships (built at index time) used by the call-graph tools.
 
-### `get_callers(function_name, path=".", context_lines=None)`
+### `get_callers(function_name, path=".", context_lines=None, directory_scope=None, domain_filter=None, action_filter=None)`
 
 Find **who calls** a given function.  Use to answer "where is X invoked?"
-Requires the codebase to have been indexed (call edges are extracted during
-`index_directory`).  Returns a JSON array of caller functions with file,
-line, cypher, and code context.
+Includes callers that invoke Celery tasks via `.delay()` or `.apply_async()`.
+Optional `directory_scope` and `domain_filter` / `action_filter` restrict results.
+Returns a JSON array of caller functions with file, line, cypher, and context.
 
-### `get_callees(function_name, path=".", file_path=None, context_lines=None)`
+### `get_callees(function_name, path=".", file_path=None, context_lines=None, directory_scope=None, domain_filter=None, action_filter=None)`
 
 Find **what** a given function **calls** (only indexed callees).  Use to
 trace execution flow downward.  Pass `file_path` to disambiguate when the
-function name exists in multiple files.  Returns a JSON array of callee
-functions with file, line, cypher, and context.
+function name exists in multiple files.  Optional scope and domain/action filters.
+Returns a JSON array of callee functions with file, line, cypher, and context.
 
-### `trace_call_chain(function_name, path=".", direction="callers", max_depth=5, context_lines=None)`
+### `trace_call_chain(function_name, path=".", direction="callers", max_depth=5, context_lines=None, directory_scope=None, domain_filter=None, action_filter=None)`
 
 Recursively trace the call graph from a function.  **direction**: `"callers"`
-(walk up: who calls this, who calls them, …) or `"callees"` (walk down: what
-this calls, what they call, …).  **max_depth** limits recursion; cycles are
-detected and will not cause infinite loops.  Returns JSON with `root`,
-`direction`, `max_depth`, and a `chain` array of nodes (each with `depth`,
-`function_name`, `file_path`, `line_start`, `cypher`, `context`).
+(walk up) or `"callees"` (walk down).  **max_depth** limits recursion; cycles
+are detected.  Optional `directory_scope` and `domain_filter` / `action_filter`
+restrict which nodes appear in the chain.  Returns JSON with `root`, `direction`,
+`max_depth`, and a `chain` array of nodes.
 
 ### `health()`
 
@@ -232,6 +242,9 @@ stats = client.stats("./project")
 callers = client.get_callers("encrypt_file_content", path="./project")
 callees = client.get_callees("process_files", path="./project")
 chain = client.trace_call_chain("add_cypher_entry", direction="callers", max_depth=4, path="./project")
+
+# Scoped search and filters (path = index root; directory_scope = subtree; domain_filter = e.g. ["BIZ", "NET"])
+hits = client.search("validate workflow", path="./project", directory_scope="src/auditor", domain_filter=["BIZ", "NET"])
 ```
 
 Async variants are available: `client.aindex()`, `client.asearch()`,

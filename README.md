@@ -136,6 +136,8 @@ This 18-character string replaces 2,000+ characters of function body for search 
 
 **Result**: Sub-second index lookup on 10,000+ function codebases.
 
+**Search & call-graph enhancements:** Use `directory_scope` to restrict results to a subtree (path = index root). Call-graph includes Celery `.delay()`/`.apply_async()` as task invocations. Filter or group results by Cypher domain/action (`domain_filter`, `action_filter`, `group_by`).
+
 ---
 
 ### 2. **Search Accuracy**
@@ -615,14 +617,14 @@ If `symdex` is not on PATH (e.g. you use a venv and Cursor runs without it), set
 
 | Tool | Description |
 |------|-------------|
-| `search_codebase(query, strategy, max_results)` | Natural-language or Cypher pattern search |
-| `search_by_cypher(cypher_pattern, max_results)` | Direct Cypher pattern lookup (no LLM) |
-| `index_directory(path, force)` | Build or refresh the sidecar index (includes call graph edges) |
-| `get_index_stats(path)` | File, function, and call_edges counts |
-| `get_callers(function_name, path)` | Find functions that call the given function (call graph) |
-| `get_callees(function_name, path, file_path)` | Find functions called by the given function (call graph) |
-| `trace_call_chain(function_name, path, direction, max_depth)` | Recursively trace callers (up) or callees (down) from a function |
-| `health()` | Server status, provider, model info |
+| `search_codebase(query, …)` | Natural-language or Cypher search. Optional: `directory_scope` (subtree), `domain_filter`, `action_filter`, `group_by`. |
+| `search_by_cypher(cypher_pattern, …)` | Direct Cypher lookup (no LLM). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `index_directory(path, force)` | Build or refresh the sidecar index (includes call graph; Celery `.delay()`/`.apply_async()` → task edges). |
+| `get_index_stats(path)` | File, function, and call_edges counts. |
+| `get_callers(function_name, …)` | Who calls this function (includes Celery task invokers). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `get_callees(function_name, …)` | What this function calls. Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `trace_call_chain(function_name, …)` | Trace callers (up) or callees (down). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `health()` | Server status, provider, model info. |
 
 ### Resources (read-only data)
 
@@ -778,40 +780,9 @@ export SYMDEX_MAX_CONCURRENT=10
 
 ---
 
-## Docker Usage
+## Docker
 
-The image includes MCP server support by default (install extras: `anthropic,mcp`). Override with build arg `EXTRAS` (e.g. `openai,mcp` or `llm-all,mcp`) if needed.
-
-```bash
-# Index a project
-docker run -v /host/project:/data symdex-100 \
-  symdex index /data
-
-# Search the index
-docker run -v /host/project:/data symdex-100 \
-  symdex search "validate user" --cache-dir /data/.symdex
-```
-
-**Note:** `--cache-dir` must be the path *inside* the container.
-
-### Running the MCP server in Docker (e.g. Smithery)
-
-The default container command runs the MCP server with **HTTP (Streamable)** transport for remote clients (Smithery, HTTP-based MCP clients):
-
-```bash
-# Default: symdex mcp --transport streamable-http (listens on 0.0.0.0:8000 for remote connections)
-docker run -p 8000:8000 -v /host/project:/data -e ANTHROPIC_API_KEY=sk-... symdex-100
-```
-
-For **stdio** (e.g. local Cursor talking to a container), override the command:
-
-```bash
-docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
-```
-
-With docker-compose, the default service runs `symdex mcp --transport streamable-http`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
-
-**Publishing on Smithery:** Smithery *can* host from GitHub, but **Hosted** deploy is for servers built with the [Smithery CLI and SDK](https://smithery.ai/docs/build/build) (TypeScript) and runs in their edge runtime—**128 MB, no filesystem, no native modules, no spawning processes** ([Hosting Limits](https://smithery.ai/docs/build/limits)). Symdex needs filesystem (SQLite index, reading source files) and a Python runtime, so it cannot run in that environment. Use the **URL** method: host the server elsewhere and give Smithery your public HTTPS URL. The server uses **Streamable HTTP** on **`/mcp`**, serves **`/.well-known/mcp/server-card.json`**, and sends CORS headers. To get a URL with no server to maintain: deploy this repo’s Docker image to [Fly.io](https://fly.io) or [Railway](https://railway.app). With Fly: install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly launch` in this repo, then `fly deploy`; at [smithery.ai/new](https://smithery.ai/new) choose **URL** and enter `https://<app-name>.fly.dev/mcp`. The repo includes `fly.toml` for Fly.
+For CLI usage, MCP in Docker, index-on-host vs remote URL, and publishing on Smithery, see **[docs/DOCKER.md](docs/DOCKER.md)**.
 
 ---
 

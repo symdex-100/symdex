@@ -27,6 +27,11 @@ All core classes accept an instance-based `SymdexConfig` so that multiple client
 ### 6. **Source Files Are Never Modified**
 All metadata is stored in a `.symdex/` sidecar directory. The indexed codebase stays pristine — no unwanted comment blocks in diffs.
 
+### 7. **Search and call-graph enhancements**
+- **Scoped search:** `path` is the index root; optional `directory_scope` restricts results to a subtree (single index, filtered by `relative_path`).
+- **Celery task callers:** AST treats `task.delay()` and `task.apply_async()` as edges to the task function, so `get_callers(task_name)` finds invokers.
+- **Domain/action filter and group_by:** Search and call-graph APIs accept optional `domain_filter` and `action_filter` (Cypher DOM/ACT); search can return results grouped by domain or action.
+
 ## Package Layout
 
 ```

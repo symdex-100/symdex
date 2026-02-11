@@ -252,7 +252,17 @@ class CodeAnalyzer:
                 if isinstance(child.func, ast.Name):
                     callee_name = child.func.id
                 elif isinstance(child.func, ast.Attribute):
-                    callee_name = child.func.attr
+                    # For task managers: task.delay() / task.apply_async() — treat task as callee
+                    if child.func.attr in ("delay", "apply_async"):
+                        value = child.func.value
+                        if isinstance(value, ast.Name):
+                            callee_name = value.id
+                        elif isinstance(value, ast.Attribute):
+                            callee_name = value.attr  # e.g. tasks.validate_task -> validate_task
+                        else:
+                            callee_name = child.func.attr
+                    else:
+                        callee_name = child.func.attr
                 if callee_name:
                     call_sites_list.append(CallSite(
                         callee_name=callee_name,
@@ -431,8 +441,16 @@ class CypherCache:
               ",".join(tags), signature, complexity, now_iso, relative_path))
         conn.commit()
 
-    def search_by_cypher(self, pattern: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search for functions matching a Cypher pattern (supports wildcards). Also matches compound OBJ (e.g. RELATIONSHIPS+AUDIT when pattern has RELATIONSHIPS)."""
+    @staticmethod
+    def _path_prefix_like(scope: str) -> str:
+        """Normalize directory_scope to a SQL LIKE pattern. relative_path is stored with /."""
+        s = scope.strip().replace("\\", "/").rstrip("/")
+        return f"{s}/%" if s else "%"
+
+    def search_by_cypher(self, pattern: str, limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for functions matching a Cypher pattern (supports wildcards). Also matches compound OBJ (e.g. RELATIONSHIPS+AUDIT when pattern has RELATIONSHIPS).
+        When path_prefix is set, only rows whose relative_path starts with that prefix are returned (scoped search).
+        """
         sql_pattern = pattern.replace("*", "%")
         # When pattern has no wildcard in OBJ (e.g. DAT:CRT_RELATIONSHIPS--SYN), also match compound OBJ (RELATIONSHIPS+AUDIT)
         patterns_to_try = [sql_pattern]
@@ -444,18 +462,24 @@ class CypherCache:
                 if "+" not in act_obj and "%" not in act_obj:
                     compound_pattern = f"{parts[0]}:{act_obj}%--{pat}".replace("*", "%")
                     patterns_to_try.append(compound_pattern)
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
         seen = set()
         results = []
+        where_extra = " AND (relative_path LIKE ? OR (relative_path IS NULL AND file_path LIKE ?))" if path_like else ""
+        params_extra = (path_like, path_like) if path_like else ()
         for p in patterns_to_try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT file_path, function_name, line_start, line_end, cypher, tags, signature, relative_path
                 FROM cypher_index
-                WHERE cypher LIKE ?
+                WHERE cypher LIKE ?""" + where_extra + """
                 ORDER BY indexed_at DESC
                 LIMIT ?
-            """, (p, limit))
+            """,
+                (p,) + params_extra + (limit,),
+            )
             for row in cursor.fetchall():
                 key = (row["file_path"], row["function_name"], row["line_start"])
                 if key not in seen:
@@ -468,33 +492,44 @@ class CypherCache:
         conn.row_factory = None
         return results
 
-    def search_by_tags(self, tag: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search for functions by tag."""
+    def search_by_tags(self, tag: str, limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for functions by tag. When path_prefix is set, only rows under that subtree are returned."""
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute("""
-            SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
-            FROM cypher_index
-            WHERE tags LIKE ?
-            LIMIT ?
-        """, (f"%{tag}%", limit))
+        if path_like:
+            cursor = conn.execute("""
+                SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
+                FROM cypher_index
+                WHERE tags LIKE ? AND (relative_path LIKE ? OR (relative_path IS NULL AND file_path LIKE ?))
+                LIMIT ?
+            """, (f"%{tag}%", path_like, path_like, limit))
+        else:
+            cursor = conn.execute("""
+                SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
+                FROM cypher_index
+                WHERE tags LIKE ?
+                LIMIT ?
+            """, (f"%{tag}%", limit))
         results = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return results
 
-    def search_by_name(self, keywords: List[str], limit: int = 50) -> List[Dict[str, Any]]:
+    def search_by_name(self, keywords: List[str], limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Search for functions whose name contains any of the given keywords.
-
-        Uses SQL LIKE with wildcard wrapping so ``delete`` matches
-        ``_delete_directory_tree_and_relations``.  The function_name column
-        is already indexed (``idx_function_name``) for fast lookups.
+        When path_prefix is set, only rows under that subtree are returned.
         """
         if not keywords:
             return []
 
         conditions = " OR ".join(["function_name LIKE ?"] * len(keywords))
         params: list = [f"%{kw}%" for kw in keywords]
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
+        if path_like:
+            conditions += " AND (relative_path LIKE ? OR (relative_path IS NULL AND file_path LIKE ?))"
+            params.extend([path_like, path_like])
+        params.append(limit)
 
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
@@ -505,7 +540,7 @@ class CypherCache:
             WHERE {conditions}
             ORDER BY indexed_at DESC
             LIMIT ?
-        """, params + [limit])
+        """, params)
         results = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return results
@@ -555,37 +590,47 @@ class CypherCache:
             """, (str(caller_file), caller_name, caller_line, callee, line))
         conn.commit()
 
-    def get_callers(self, function_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_callers(self, function_name: str, limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         """Find indexed functions that call *function_name*.
-
-        Joins ``call_edges`` (callee side) with ``cypher_index`` to return
-        full metadata for each caller.  Only callers that are themselves
-        indexed appear in the results.
+        When path_prefix is set, only callers whose relative_path is under that subtree are returned.
         """
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute("""
-            SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
-                   ci.cypher, ci.tags, ci.signature, ci.relative_path
-            FROM call_edges ce
-            JOIN cypher_index ci
-              ON ci.file_path = ce.caller_file AND ci.function_name = ce.caller_name
-            WHERE ce.callee_name = ?
-            ORDER BY ci.file_path, ci.line_start
-            LIMIT ?
-        """, (function_name, limit))
+        if path_like:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci
+                  ON ci.file_path = ce.caller_file AND ci.function_name = ce.caller_name
+                WHERE ce.callee_name = ? AND (ci.relative_path LIKE ? OR (ci.relative_path IS NULL AND ci.file_path LIKE ?))
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, path_like, path_like, limit))
+        else:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci
+                  ON ci.file_path = ce.caller_file AND ci.function_name = ce.caller_name
+                WHERE ce.callee_name = ?
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, limit))
         results = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return results
 
     def get_callees(self, function_name: str, caller_file: str | None = None,
-                    limit: int = 50) -> List[Dict[str, Any]]:
+                    limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         """Find indexed functions called by *function_name*.
-
-        When *caller_file* is provided, restricts to edges originating
-        from that file (useful when the function name is ambiguous).
-        Only callees that are themselves indexed are returned.
+        When path_prefix is set, only callees under that subtree are returned.
         """
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
+        path_cond = " AND (ci.relative_path LIKE ? OR (ci.relative_path IS NULL AND ci.file_path LIKE ?))" if path_like else ""
+        path_params = (path_like, path_like) if path_like else ()
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
         if caller_file:
@@ -594,20 +639,20 @@ class CypherCache:
                        ci.cypher, ci.tags, ci.signature, ci.relative_path
                 FROM call_edges ce
                 JOIN cypher_index ci ON ci.function_name = ce.callee_name
-                WHERE ce.caller_name = ? AND ce.caller_file = ?
+                WHERE ce.caller_name = ? AND ce.caller_file = ?""" + path_cond + """
                 ORDER BY ci.file_path, ci.line_start
                 LIMIT ?
-            """, (function_name, caller_file, limit))
+            """, (function_name, caller_file) + path_params + (limit,))
         else:
             cursor = conn.execute("""
                 SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
                        ci.cypher, ci.tags, ci.signature, ci.relative_path
                 FROM call_edges ce
                 JOIN cypher_index ci ON ci.function_name = ce.callee_name
-                WHERE ce.caller_name = ?
+                WHERE ce.caller_name = ?""" + path_cond + """
                 ORDER BY ci.file_path, ci.line_start
                 LIMIT ?
-            """, (function_name, limit))
+            """, (function_name,) + path_params + (limit,))
         results = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return results
@@ -805,6 +850,7 @@ class CypherGenerator:
         self._provider_name = provider
         # Lazy — created on first actual LLM call via _ensure_llm()
         self.llm: LLMProvider | None = None
+        self._llm_unavailable_logged = False
 
     # Maximum length of a valid Cypher string (e.g. "SEC:VAL_HTTPREQUEST--ASY").
     # Responses longer than this that don't validate are treated as
@@ -898,6 +944,15 @@ class CypherGenerator:
                     f"Invalid Cypher on attempt {attempt}/{cfg.retry_attempts}: "
                     f"'{stripped}' for {metadata.name}"
                 )
+            except (ImportError, ModuleNotFoundError) as e:
+                # LLM provider or dependency (e.g. jiter) missing — don't retry or spam logs
+                if not getattr(self, "_llm_unavailable_logged", False):
+                    self._llm_unavailable_logged = True
+                    logger.warning(
+                        "LLM unavailable (%s). Using rule-based fallback for all functions.",
+                        e,
+                    )
+                return self._generate_fallback_cypher(metadata)
             except Exception as e:
                 logger.warning(
                     f"API error on attempt {attempt}/{cfg.retry_attempts} "
@@ -945,6 +1000,14 @@ class CypherGenerator:
                 patterns = self._parse_tiered_cypher_response(raw)
                 if patterns:
                     return patterns
+            except (ImportError, ModuleNotFoundError) as e:
+                if not getattr(self, "_llm_unavailable_logged", False):
+                    self._llm_unavailable_logged = True
+                    logger.warning(
+                        "LLM unavailable (%s). Using keyword-based query translation.",
+                        e,
+                    )
+                return [CypherGenerator._keyword_based_translation(natural_query)]
             except Exception as e:
                 if attempt >= cfg.retry_attempts:
                     logger.error(

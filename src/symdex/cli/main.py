@@ -485,6 +485,72 @@ def _emit_call_graph_results(results: list, fmt: str, *, caller_or_callee: str =
 
 
 # ---------------------------------------------------------------------------
+# symdex watch
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("directory", default=".", type=click.Path(exists=True, file_okay=False))
+@click.option("--interval", type=int, default=300,
+              help="Minimum seconds between re-indexes (default: 300).")
+@click.option("--debounce", type=int, default=5,
+              help="Seconds to wait after last file change before re-indexing (default: 5).")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def watch(ctx: click.Context, directory: str, interval: int, debounce: int, verbose: bool):
+    """Watch DIRECTORY and auto-reindex when Python files change.
+
+    Uses watchdog for real-time file events if installed (pip install watchdog),
+    otherwise falls back to polling every --interval seconds. Press Ctrl+C to stop.
+    """
+    import signal
+    import threading
+    import time
+    cfg: SymdexConfig = ctx.obj["config"]
+    _configure_logging(verbose, cfg)
+    _validate_config(cfg)
+
+    root_dir = Path(directory).resolve()
+    from symdex import Symdex
+    from symdex.core.autoreindex import start_auto_reindex
+
+    client = Symdex(config=cfg)
+    # Initial index so the index exists before watching
+    try:
+        click.echo(f"Initial index of {root_dir}...")
+        result = client.index(root_dir, show_progress=True)
+        click.echo(f"Indexed {result.files_processed} files, {result.functions_indexed} functions.")
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    reindexer = start_auto_reindex(
+        root_dir, client,
+        interval_seconds=interval,
+        debounce_seconds=debounce,
+    )
+    shutdown = threading.Event()
+
+    def _on_sig(_signum, _frame):
+        shutdown.set()
+
+    try:
+        signal.signal(signal.SIGINT, _on_sig)
+    except (ValueError, OSError):
+        # Signal only valid in main thread; or unsupported on this platform
+        pass
+
+    click.echo(f"Watching for changes (interval={interval}s, debounce={debounce}s). Press Ctrl+C to stop.")
+    try:
+        while not shutdown.is_set():
+            shutdown.wait(timeout=1)
+    except KeyboardInterrupt:
+        shutdown.set()
+    finally:
+        reindexer.stop()
+        click.echo("Stopped.")
+
+
+# ---------------------------------------------------------------------------
 # symdex mcp
 # ---------------------------------------------------------------------------
 

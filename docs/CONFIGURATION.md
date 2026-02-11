@@ -149,6 +149,8 @@ When a tool param is **not** sent by the client, the server uses **SymdexConfig*
 
 No search-default overrides; other options (e.g. `path`, `force`) are fixed defaults.
 
+**Path resolution:** When the client passes `path="."` (the default), the MCP server resolves it on the **machine where the server runs**. If the server runs in Docker with your project mounted at `/data`, set **`SYMDEX_DEFAULT_PATH=/data`** so that `"."` is resolved to `/data` and index/search use the mounted project (and the index is written under the mount on the host).
+
 ### get_callers / get_callees / trace_call_chain (call graph)
 
 | Param | Config field | Default | Env override |
@@ -202,6 +204,7 @@ No search-default overrides; other options (e.g. `path`, `force`) are fixed defa
 | `SYMDEX_DEFAULT_MAX_RESULTS` | `10` | Default max hits for search_codebase / search_by_cypher |
 | `SYMDEX_DEFAULT_CONTEXT_LINES` | `3` | Default context lines per result |
 | `SYMDEX_DEFAULT_EXCLUDE_TESTS` | `true` | Default exclude_tests (set to 0/false/no to include tests by default) |
+| `SYMDEX_DEFAULT_PATH` | — | When set, `path="."` is resolved to this path (e.g. `/data` in Docker so index/search use the mounted project) |
 | `CYPHER_MIN_SCORE` | `5.0` | Minimum score for a result to be included (API/engine) |
 | `SYMDEX_LLM_PROVIDER` | `anthropic` | LLM for indexing/query translation |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | — | Required for the chosen provider |
