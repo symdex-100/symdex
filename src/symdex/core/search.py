@@ -777,8 +777,15 @@ class ResultFormatter:
 
     @staticmethod
     def _detect_language(file_path: str) -> str:
-        """Return language label (Python-only for v1)."""
-        return "Python" if file_path.endswith(".py") else ""
+        """Return language label (Python, JavaScript, or TypeScript)."""
+        p = file_path.lower()
+        if p.endswith(".py"):
+            return "Python"
+        if p.endswith(".js") or p.endswith(".jsx"):
+            return "JavaScript"
+        if p.endswith(".ts") or p.endswith(".tsx"):
+            return "TypeScript"
+        return ""
 
     @staticmethod
     def _numbered_preview(context: str, start_line: int) -> List[str]:

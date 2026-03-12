@@ -1,9 +1,9 @@
 """
 Symdex-100 Core Engine
 
-Python-focused code analysis, caching, Cypher generation, and search scoring.
-Uses Python's AST module for precise function extraction.
-Production-grade with comprehensive error handling and logging.
+Multi-language code analysis (Python, JavaScript/TypeScript), caching,
+Cypher generation, and search scoring. Uses Python's AST for Python and
+tree-sitter for JS/TS (built-in). Production-grade with comprehensive error handling and logging.
 """
 
 import ast
@@ -15,15 +15,15 @@ import threading
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from symdex.core.config import Config, CypherSchema, Prompts, SymdexConfig
 
-# NOTE: Module-level logging.basicConfig() removed (v1.1).
-# Application code (CLI, MCP server) is responsible for configuring logging.
-# This avoids side effects when symdex is imported as a library.
 logger = logging.getLogger(__name__)
+
+# File extensions that use the JS/TS tree-sitter extractor.
+JS_TS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx"})
 
 
 # =============================================================================
@@ -184,10 +184,13 @@ class CodeAnalyzer:
     @staticmethod
     def extract_functions(source_code: str, file_path: str = "<string>") -> List[FunctionMetadata]:
         """
-        Extract all function / method definitions from Python source code.
-        
-        Uses Python's AST module for accurate, robust extraction.
+        Extract all function / method definitions from source code.
+
+        Dispatches by file extension: Python (ast) or JavaScript/TypeScript (tree-sitter).
         """
+        ext = Path(file_path).suffix.lower()
+        if ext in JS_TS_EXTENSIONS:
+            return CodeAnalyzer._extract_js_ts(source_code, file_path)
         return CodeAnalyzer._extract_python_ast(source_code, file_path)
 
     @staticmethod
@@ -295,6 +298,20 @@ class CodeAnalyzer:
             call_sites=call_sites_list,
         )
 
+    # ── JavaScript/TypeScript (tree-sitter) ───────────────────────
+
+    @staticmethod
+    def _extract_js_ts(source_code: str, file_path: str) -> List[FunctionMetadata]:
+        """Extract functions from JavaScript/TypeScript using tree-sitter."""
+        try:
+            from symdex.core._js_ts_parser import parse_js_ts_functions
+            return parse_js_ts_functions(source_code, file_path)
+        except ImportError as e:
+            logger.warning(
+                "tree-sitter-language-pack not available; JS/TS files will be skipped: %s", e
+            )
+            return []
+
     # ── Helpers ───────────────────────────────────────────────────
 
     @staticmethod
@@ -375,9 +392,17 @@ class CypherCache:
                 complexity TEXT,
                 indexed_at TIMESTAMP NOT NULL,
                 relative_path TEXT,
+                language TEXT DEFAULT 'Python',
                 FOREIGN KEY (file_path) REFERENCES indexed_files (file_path) ON DELETE CASCADE
             )
         """)
+        # Backfill language column for existing DBs created before multi-language support
+        try:
+            conn.execute("ALTER TABLE cypher_index ADD COLUMN language TEXT DEFAULT 'Python'")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
         # Create indexes for fast searching
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cypher ON cypher_index(cypher)")
@@ -429,16 +454,17 @@ class CypherCache:
 
     def add_cypher_entry(self, file_path: Path, function_name: str, line_start: int,
                          line_end: int, cypher: str, tags: List[str],
-                         signature: str, complexity: str, relative_path: str | None = None):
+                         signature: str, complexity: str, relative_path: str | None = None,
+                         language: str = "Python"):
         """Add a Cypher entry to the index. relative_path is path relative to project root (portable across machines)."""
         conn = self._get_connection()
         now_iso = datetime.now().isoformat()
         conn.execute("""
             INSERT INTO cypher_index
-            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at, relative_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at, relative_path, language)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(file_path), function_name, line_start, line_end, cypher,
-              ",".join(tags), signature, complexity, now_iso, relative_path))
+              ",".join(tags), signature, complexity, now_iso, relative_path, language))
         conn.commit()
 
     @staticmethod
@@ -904,10 +930,13 @@ class CypherGenerator:
 
         for attempt in range(1, cfg.retry_attempts + 1):
             try:
+                code_fence = metadata.language.lower()  # python, javascript, typescript
                 cypher = self._ensure_llm().complete(
                     system=Prompts.CYPHER_GENERATION_SYSTEM,
                     user_message=Prompts.CYPHER_GENERATION_USER.format(
                         code=function_code,
+                        language=metadata.language,
+                        code_fence=code_fence,
                     ),
                     max_tokens=cfg.llm_max_tokens,
                     temperature=cfg.llm_temperature,
@@ -1163,13 +1192,14 @@ class CypherGenerator:
 
 def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[Path]:
     """
-    Recursively scan for Python source files (.py).
+    Recursively scan for source files (Python, JavaScript/TypeScript by default).
 
     Uses :func:`os.walk` with **early directory pruning** so that
     excluded subtrees (e.g. ``.git/``, ``__pycache__/``) are never
     entered — a significant speedup on large repositories.
 
-    Respects ``config.target_extensions`` and ``config.exclude_dirs``.
+    Respects ``config.target_extensions`` (default: .py, .js, .jsx, .ts, .tsx)
+    and ``config.exclude_dirs``.
     """
     import os
 

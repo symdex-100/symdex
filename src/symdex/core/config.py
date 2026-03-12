@@ -54,7 +54,7 @@ class SymdexConfig:
     retry_backoff_base: float = 2.0
 
     # ── File Processing ───────────────────────────────────────────
-    target_extensions: frozenset = frozenset((".py",))
+    target_extensions: frozenset = frozenset((".py", ".js", ".jsx", ".ts", ".tsx"))
     exclude_dirs: frozenset = frozenset((
         "__pycache__", ".git", ".venv", "venv",
         ".pytest_cache", "dist", "build", ".symdex",
@@ -250,9 +250,9 @@ class Config:
     RETRY_ATTEMPTS: int = 3
     RETRY_BACKOFF_BASE: float = 2.0
     
-    # File Processing — Python only (v1)
+    # File Processing — Python and JavaScript/TypeScript (built-in)
     # frozenset for O(1) membership tests during directory scanning
-    TARGET_EXTENSIONS: frozenset = frozenset((".py",))
+    TARGET_EXTENSIONS: frozenset = frozenset((".py", ".js", ".jsx", ".ts", ".tsx"))
     EXCLUDE_DIRS: frozenset = frozenset((
         "__pycache__", ".git", ".venv", "venv",
         ".pytest_cache", "dist", "build",
@@ -578,9 +578,9 @@ EXAMPLES (single OBJ when one clear object; compound when multiple objects):
 - "def store_developer_commits(self, audit_uuid): ..." → DAT:AGG_DATASET+DEVELOPER+COMMITS--SYN
 """
     
-    CYPHER_GENERATION_USER = """Analyze this Python function and generate its Cypher.
+    CYPHER_GENERATION_USER = """Analyze this {language} function and generate its Cypher.
 
-```python
+```{code_fence}
 {code}
 ```
 

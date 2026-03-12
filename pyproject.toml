@@ -31,6 +31,7 @@ classifiers = [
 dependencies = [
     "click>=8.1.0",
     "tqdm>=4.66.0",
+    "tree-sitter-language-pack>=0.13.0",
 ]
 
 [project.optional-dependencies]

@@ -151,7 +151,9 @@ class TestPrompts:
 
     def test_generation_user_renders_correctly(self):
         rendered = Prompts.CYPHER_GENERATION_USER.format(
-            code="def foo(): pass"
+            code="def foo(): pass",
+            language="Python",
+            code_fence="python",
         )
         assert "Python" in rendered
         assert "def foo()" in rendered

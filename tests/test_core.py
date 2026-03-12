@@ -68,6 +68,26 @@ class TestCodeAnalyzerPython:
 
 
 # =============================================================================
+# CodeAnalyzer — JavaScript/TypeScript (optional tree-sitter)
+# =============================================================================
+
+class TestCodeAnalyzerJsTs:
+    """JS/TS extraction (tree-sitter is a required dependency)."""
+
+    def test_extract_functions_dispatches_by_extension(self):
+        """Passing a .js path returns a list from the JS/TS extractor."""
+        funcs = CodeAnalyzer.extract_functions("function bar() {}", "file.js")
+        assert isinstance(funcs, list)
+
+    def test_extract_js_function(self):
+        """JS function is extracted via tree-sitter."""
+        funcs = CodeAnalyzer.extract_functions("function bar() { return 1; }", "file.js")
+        assert len(funcs) == 1
+        assert funcs[0].name == "bar"
+        assert funcs[0].language == "JavaScript"
+
+
+# =============================================================================
 # CodeAnalyzer — Shared helpers
 # =============================================================================
 

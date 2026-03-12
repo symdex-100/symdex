@@ -273,6 +273,7 @@ class IndexingPipeline:
                     func_meta.start_line, func_meta.end_line,
                     cypher, tags, signature, complexity,
                     relative_path=rel_path,
+                    language=func_meta.language,
                 )
 
                 # Store call edges for the call graph (callee resolution happens at query time)
