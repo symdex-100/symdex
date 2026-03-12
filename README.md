@@ -880,7 +880,7 @@ A: Smithery **Hosted** (GitHub → they build and run) only runs servers built w
 
 ### Indexing Algorithm
 
-1. **File scanning** — `os.walk()` with early pruning (excludes `.git`, `__pycache__`, etc.)
+1. **File scanning** — `os.walk()` with early pruning. Dotfiles and dot-directories (e.g. `.git`, `.cursor`, `.env`) are always excluded; built-in dirs (e.g. `__pycache__`, `node_modules`) and optional `.symdexignore` add further exclusions.
 2. **AST parsing** — Python's `ast` module extracts function metadata (name, args, docstring, calls, call_sites, complexity)
 3. **Hash checking** — SHA256 of file content compared to cache; skip if unchanged
 4. **Cypher generation** — LLM translates function → Cypher (with rule-based fallback)

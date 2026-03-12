@@ -1190,6 +1190,53 @@ class CypherGenerator:
 # Utility Functions
 # =============================================================================
 
+SYMDEXIGNORE_FILENAME = ".symdexignore"
+
+
+def load_symdexignore(root_path: Path) -> List[str]:
+    """
+    Read ignore patterns from ``.symdexignore`` at the index root.
+
+    Returns a list of non-empty, stripped lines; lines starting with ``#``
+    and blank lines are skipped. Patterns are used to exclude files and
+    directories when scanning (see :func:`_path_matches_ignore`).
+    """
+    ignore_file = Path(root_path).resolve() / SYMDEXIGNORE_FILENAME
+    if not ignore_file.is_file():
+        return []
+    patterns: List[str] = []
+    try:
+        for line in ignore_file.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                patterns.append(s)
+    except OSError as e:
+        logger.warning("Could not read %s: %s", ignore_file, e)
+    return patterns
+
+
+def _path_matches_ignore(rel_path: str, patterns: List[str]) -> bool:
+    """
+    Return True if ``rel_path`` (forward slashes, relative to index root)
+    matches any ignore pattern. Supports simple names (e.g. ``node_modules``),
+    path prefixes (e.g. ``frontend/dist``), and fnmatch globs (e.g. ``*.min.js``).
+    """
+    import fnmatch
+
+    if not patterns:
+        return False
+    norm = rel_path.replace("\\", "/")
+    for p in patterns:
+        p_norm = p.replace("\\", "/").rstrip("/")
+        if "*" in p or "?" in p:
+            if fnmatch.fnmatch(norm, p) or fnmatch.fnmatch(norm, p_norm + "/*"):
+                return True
+        else:
+            if norm == p_norm or norm.endswith("/" + p_norm) or norm.startswith(p_norm + "/"):
+                return True
+    return False
+
+
 def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[Path]:
     """
     Recursively scan for source files (Python, JavaScript/TypeScript by default).
@@ -1198,8 +1245,9 @@ def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[
     excluded subtrees (e.g. ``.git/``, ``__pycache__/``) are never
     entered — a significant speedup on large repositories.
 
-    Respects ``config.target_extensions`` (default: .py, .js, .jsx, .ts, .tsx)
-    and ``config.exclude_dirs``.
+    Respects ``config.target_extensions`` (default: .py, .js, .jsx, .ts, .tsx),
+    ``config.exclude_dirs``, and patterns from ``.symdexignore`` in the root.
+    Dotfiles and dot-directories (e.g. ``.git``, ``.cursor``, ``.env``) are always excluded.
     """
     import os
 
@@ -1208,14 +1256,29 @@ def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[
     exclude = cfg.exclude_dirs            # frozenset — O(1) lookups
     extensions = cfg.target_extensions     # frozenset — O(1) lookups
     max_bytes = cfg.max_file_size_mb * 1024 * 1024
+    root_resolved = Path(root_path).resolve()
+    ignore_patterns = load_symdexignore(root_resolved)
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         # ── Prune excluded directories IN-PLACE so os.walk never
         #    descends into them.  Modifying dirnames[:] is the
         #    documented way to control os.walk traversal.
-        dirnames[:] = [d for d in dirnames if d not in exclude]
+        def _dir_ignored(d: str) -> bool:
+            if d.startswith("."):
+                return True
+            if d in exclude:
+                return True
+            try:
+                rel = (Path(dirpath) / d).resolve().relative_to(root_resolved).as_posix()
+                return _path_matches_ignore(rel, ignore_patterns)
+            except ValueError:
+                return False
+
+        dirnames[:] = [d for d in dirnames if not _dir_ignored(d)]
 
         for fname in filenames:
+            if fname.startswith("."):
+                continue
             # Fast extension check (splitext is C-level, frozenset lookup is O(1))
             _, ext = os.path.splitext(fname)
             if ext not in extensions:
@@ -1225,6 +1288,10 @@ def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[
             try:
                 size = os.path.getsize(full)
             except OSError:
+                continue
+
+            rel_path = Path(full).resolve().relative_to(root_resolved).as_posix()
+            if _path_matches_ignore(rel_path, ignore_patterns):
                 continue
 
             if size <= max_bytes:
