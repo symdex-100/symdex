@@ -27,6 +27,11 @@ All core classes accept an instance-based `SymdexConfig` so that multiple client
 ### 6. **Source Files Are Never Modified**
 All metadata is stored in a `.symdex/` sidecar directory. The indexed codebase stays pristine — no unwanted comment blocks in diffs.
 
+### 7. **Search and call-graph enhancements**
+- **Scoped search:** `path` is the index root; optional `directory_scope` restricts results to a subtree (single index, filtered by `relative_path`).
+- **Celery task callers:** AST treats `task.delay()` and `task.apply_async()` as edges to the task function, so `get_callers(task_name)` finds invokers.
+- **Domain/action filter and group_by:** Search and call-graph APIs accept optional `domain_filter` and `action_filter` (Cypher DOM/ACT); search can return results grouped by domain or action.
+
 ## Package Layout
 
 ```
@@ -130,6 +135,7 @@ src/symdex/
 - Function/method name, line numbers, arguments
 - Async/sync detection
 - Called functions (for tag generation)
+- **Call sites** (callee name + line number per call) for the call graph
 - Docstrings
 - Cyclomatic complexity approximation (branch counting)
 
@@ -157,6 +163,13 @@ cypher_index:
   - line_start, line_end
   - cypher (INDEXED for fast LIKE queries)
   - tags, signature, complexity
+  - relative_path (portable path for cross-machine context resolution)
+
+call_edges (call graph, built at index time):
+  - caller_file, caller_name, caller_line
+  - callee_name, call_line
+  - FOREIGN KEY (caller_file) → indexed_files
+  - INDEXED on callee_name and (caller_name, caller_file) for get_callers/get_callees
 ```
 
 **Thread-local connections**: Each thread reuses a single `sqlite3.Connection` via `threading.local()`. This avoids per-method connection overhead while remaining thread-safe (each thread gets its own connection).
@@ -210,7 +223,8 @@ Each provider accepts `api_key` and `model` at construction. The `complete(syste
 
 | Class | Purpose |
 |-------|---------|
-| `FunctionMetadata` | AST-extracted function info (name, lines, args, calls, docstring, complexity) |
+| `CallSite` | A single call detected in a function (callee_name, line) for call graph |
+| `FunctionMetadata` | AST-extracted function info (name, lines, args, calls, call_sites, docstring, complexity) |
 | `CypherMeta` | Parsed SEARCH_META block (cypher, tags, signature, complexity) |
 | `SearchResult` | Ranked search hit (file, function, lines, cypher, score, context) |
 | `IndexResult` | Typed return from `IndexingPipeline.run()` (counts for files/functions/errors) |
@@ -232,7 +246,7 @@ Each provider accepts `api_key` and `model` at construction. The `complete(syste
    ↓
 5. Tag Generation (from name, calls, docstring, patterns)
    ↓
-6. SQLite Insert (into .symdex/index.db — source files untouched)
+6. SQLite Insert (cypher_index + call_edges from FunctionMetadata.call_sites)
    ↓
 7. Return IndexResult (typed dataclass with all statistics)
 ```
@@ -343,7 +357,17 @@ Scoring includes exact word overlap and substring matching against function name
 - `'keyword'`: Rule-based translation (fast, offline-capable, ~5ms)
 - `'direct'`: Skip translation (query is already a Cypher pattern)
 
-#### 4.6 Result Formatting
+#### 4.6 Call Graph (get_callers, get_callees, trace_call_chain)
+
+The search engine exposes **call graph** queries using the `call_edges` table populated at index time:
+
+- **get_callers(function_name)** — Returns indexed functions that call the given function (JOIN call_edges → cypher_index on caller side). Use to answer "who calls X?".
+- **get_callees(function_name, file_path=None)** — Returns indexed functions called by the given function (JOIN on callee side). Only callees that are themselves indexed appear; external/built-in calls are excluded. Use to answer "what does X call?".
+- **trace_call_chain(function_name, direction, max_depth)** — Recursively walks the graph in direction `"callers"` (up) or `"callees"` (down), returning a flat list of nodes with `depth`. Cycles are detected and do not cause infinite recursion.
+
+Results are returned as `SearchResult` objects (get_callers/get_callees) or a list of dicts with depth (trace_call_chain), with optional code context.
+
+#### 4.7 Result Formatting
 
 `ResultFormatter` supports four output modes:
 
@@ -395,7 +419,7 @@ Built on [FastMCP](https://github.com/jlowin/fastmcp). Accepts a `SymdexConfig` 
 
 | Primitive | Items |
 |-----------|-------|
-| **Tools** | `search_codebase`, `search_by_cypher`, `index_directory`, `get_index_stats`, `health` |
+| **Tools** | `search_codebase`, `search_by_cypher`, `index_directory`, `get_index_stats`, `get_callers`, `get_callees`, `trace_call_chain`, `health` |
 | **Resources** | `symdex://schema/domains`, `symdex://schema/actions`, `symdex://schema/patterns`, `symdex://schema/full` |
 | **Prompts** | `find_security_functions`, `audit_domain`, `explore_codebase` |
 

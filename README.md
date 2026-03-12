@@ -4,15 +4,15 @@
 
 ![Symdex Robot](./docs/symdex-100.png)
 
-*Symdex-100 — your AI companion for code exploration*
+*smydex-100 - your AI companion for code exploration*
 
 </div>
 
 ---
 
-**Semantic fingerprints for intent-based Python code search — 50–100x faster index lookups, 10–50x fewer tokens for AI agents.**
+**Semantic fingerprints for 100x faster Python code search.**
 
-Symdex-100 generates compact, structured metadata ("Cyphers") for every function in your Python codebase. Each Cypher is typically 20 bytes — a semantic fingerprint that enables sub-second, intent-based code search for developers and AI agents without reading thousands of lines of code.
+Symdex-100 generates compact, structured metadata ("Cyphers") for every function in your Python codebase. Each Cypher is a 20-byte semantic fingerprint that enables sub-second, intent-based code search for developers and AI agents — without reading thousands of lines of code.
 
 ```python
 # Your Python function → Indexed automatically
@@ -50,13 +50,12 @@ Traditional code search methods scale poorly on large codebases:
 
 | Approach | Limitation | Token Cost (AI agents) |
 |----------|-----------|------------------------|
-| **grep** | Keyword noise — finds "token" in comments, strings, variable names | 3,000+ tokens (read all matches, many false positives) |
-| **Full-text search** | No semantic understanding — can't distinguish intent | 5,000+ tokens (read 10 files, variable success) |
-| **Embeddings** | Opaque, expensive, query-time overhead | 2,000+ tokens (re-rank results, embedding index size) |
+| **grep** | Keyword noise — finds "token" in comments, strings, variable names | 3,000+ tokens (read all matches) |
+| **Full-text search** | No semantic understanding — can't distinguish intent | 5,000+ tokens (read 10 files) |
+| **Embeddings** | Opaque, expensive, query-time overhead | 2,000+ tokens (re-rank results) |
 | **AST/LSP** | Limited to structural queries (class/function names) | N/A (doesn't understand "what validates X") |
-| **Symdex** | Requires indexing step (one-time per codebase) | ~100–300 tokens (1–5 precise results with context) |
 
-**Result**: Developers waste time reading irrelevant code. AI agents burn tokens on noise. Symdex reduces token usage by **10–50x** for intent-based queries (vs reading multiple files) while providing sub-second index lookups.
+**Result**: Developers waste time reading irrelevant code. AI agents burn tokens on noise.
 
 ---
 
@@ -84,7 +83,7 @@ Each Cypher follows a strict four-slot hierarchy designed for both machine filte
 **Formal specification:**
 
 $$
-\text{Cypher} = \text{DOM} : \text{ACT} \text{OBJ} \text{--} \text{PAT}
+\text{Cypher} = \text{DOM} : \text{ACT} \_ \text{OBJ} \text{--} \text{PAT}
 $$
 
 Where:
@@ -93,7 +92,7 @@ Where:
 
 - **ACT** *(Action)*: Primary operation — `VAL` (Validate), `FET` (Fetch), `TRN` (Transform), `CRT` (Create), `SND` (Send), `SCR` (Scrub), `UPD` (Update), `AGG` (Aggregate), `FLT` (Filter), `DEL` (Delete)
 
-- **OBJ** *(Object)*: Target entity — `USER`, `TOKEN`, `DATASET`, `CONFIG`, `LOGS`, `REQUEST`, `JSON`, `EMAIL`, `DIR`. Can be compound (primary+secondary+tertiary, max 3 parts) when function involves multiple objects: `RELATIONSHIPS+AUDIT`, `RECORD+INDEX`, `FILE+CACHE`
+- **OBJ** *(Object)*: Target entity — `USER`, `TOKEN`, `DATASET`, `CONFIG`, `LOGS`, `REQUEST`, `JSON`, `EMAIL`, `DIR`
 
 - **PAT** *(Pattern)*: Execution model — `ASY` (Async), `SYN` (Synchronous), `REC` (Recursive), `GEN` (Generator), `DEC` (Decorator), `CTX` (Context manager)
 
@@ -111,7 +110,7 @@ SEC:SCR_EMAIL--ASY
 - `EMAIL` = Email object
 - `ASY` = Asynchronous pattern
 
-This 18-character string (or 30–40 chars with compound OBJ like `RELATIONSHIPS+AUDIT`) replaces 2,000+ characters of function body for search purposes — a **50–100:1 compression ratio** with zero semantic loss. Compound OBJ improves ranking for multi-concept queries (e.g. "audit relations" → functions with `RELATIONSHIPS+AUDIT` rank higher than single-OBJ matches).
+This 18-character string replaces 2,000+ characters of function body for search purposes — a **100:1 compression ratio** with zero semantic loss.
 
 ---
 
@@ -127,6 +126,7 @@ This 18-character string (or 30–40 chars with compound OBJ like `RELATIONSHIPS
 |--------|------|------------------|-------------|
 | Data scanned per query | ~50MB (full codebase) | ~100KB (index) | **500x less I/O** |
 | Index lookup (5,000 functions) | 800ms | 8ms | **100x faster** |
+| Index size | N/A (no index) | 2MB | **25:1 compression** |
 
 **Technical details:**
 - SQLite B-tree: O(log N) lookups with compound indexes on `(cypher, tags, function_name)`
@@ -135,6 +135,8 @@ This 18-character string (or 30–40 chars with compound OBJ like `RELATIONSHIPS
 - **Reported search time** in CLI/API is index lookup only (excludes LLM translation for natural-language queries)
 
 **Result**: Sub-second index lookup on 10,000+ function codebases.
+
+**Search & call-graph enhancements:** Use `directory_scope` to restrict results to a subtree (path = index root). Call-graph includes Celery `.delay()`/`.apply_async()` as task invocations. Filter or group results by Cypher domain/action (`domain_filter`, `action_filter`, `group_by`).
 
 ---
 
@@ -164,6 +166,14 @@ Merge + Cap candidates (default 200) + Score against tight pattern
 Ranked Results (exact match + domain/action/object = highest score)
 ```
 
+**Scoring:** ACT (action) and OBJ (object) dominate — they encode *what* the function does and *on what*. Domain and pattern follow. Wrong domain (e.g. result is TST when query asked for BIZ) is penalized.
+
+$$
+\text{score} = 10[\text{exact}] + 6[\text{action}] + 5[\text{object}] + 4[\text{domain}] + 2[\text{pattern}] + 3[\text{name}] + 1.5[\text{tags}] - 3[\text{domain mismatch}]
+$$
+
+Where $[\text{x}]$ is 1 if matched, 0 otherwise (with partial matching for names and object similarity).
+
 **Result**: High precision from tiered + tight-pattern scoring; cross-domain recall when needed; fewer irrelevant results (candidate cap, Lane 3 skip, smaller tag/name limits).
 
 ---
@@ -172,21 +182,23 @@ Ranked Results (exact match + domain/action/object = highest score)
 
 **Problem**: Agents waste 80-90% of context on reading irrelevant code when exploring large codebases.
 
-**Solution**: Symdex provides **10–50x token reduction** via semantic search, depending on the alternative approach.
+**Solution**: Symdex provides a 50:1 token reduction via semantic search.
 
 **Scenario:** Agent needs to find "function that validates user login credentials"
 
-| Approach | Process | Tokens | Notes |
-|----------|---------|--------|-------|
-| **Read 10 files** | Agent guesses likely files → reads all → searches manually | ~5,000 | High token cost, variable success |
-| **Grep + read** | `grep "login\|credential"` → read 20 matches → filter manually | ~3,000 | Many false positives |
-| **Symdex (1 result)** | `search_codebase("validate login credentials")` → 1 precise result | ~100 | **50x reduction** |
-| **Symdex (5 results)** | Same query → top 5 results with context | ~300 | **10–15x reduction** vs reading 10 files |
+| Approach | Process | Tokens |
+|----------|---------|--------|
+| **Read 10 files** | Agent guesses likely files → reads all → searches manually | ~5,000 |
+| **Grep + read** | `grep "login\|credential"` → read 20 matches → filter manually | ~3,000 |
+| **Symdex** | `search_codebase("validate login credentials")` → 1 precise result | ~100 |
 
-**Savings:** 
-- **50x fewer tokens** when the alternative is reading 10+ files or scanning many grep hits
-- **10–15x fewer tokens** when returning 5 results vs reading 10 files
-- **2–3x fewer tokens** when the alternative is reading 1–2 files (fewer file opens, result set instead of full file)
+**Token breakdown (Symdex approach):**
+- Query: 20 tokens
+- MCP tool call overhead: 30 tokens
+- Result (1 function, 5-line preview): 50 tokens
+- **Total: 100 tokens**
+
+**Savings: 50x fewer tokens, zero false positives.**
 
 **Why this matters:**
 - 200K context window → explore 50x more functions
@@ -206,26 +218,11 @@ Ranked Results (exact match + domain/action/object = highest score)
 | "validate token" | 47 results (includes `token = ...`, `# token expired`, `TOKEN_KEY`) | 3 results (only functions that *validate* tokens) |
 | "delete user" | 89 results (includes `# delete user later`, `user.delete_flag`) | 2 results (only functions that *delete* users) |
 
-**Precision improvement:** Far fewer false positives than keyword search; actual ratios depend on codebase and query. Symdex matches function-level *intent* (domain, action, object), so mentions in variable names or comments are not returned as function results.
+**Precision improvement:** 15x fewer false positives on average.
 
 ---
 
 ## Use Cases & Best Practices
-
-### Repository size and when Symdex works best
-
-Effectiveness correlates with codebase size:
-
-| Size | Indexed functions | Recommendation |
-|------|-------------------|----------------|
-| **Very small** | &lt;50 | Skip Symdex — indexing overhead outweighs benefits; read files or use grep. |
-| **Small** | 50–500 | Optional — intent search works, but grep with good keywords often suffices. |
-| **Medium** | 500–3,000 | **Sweet spot** — one natural-language query often returns the right function in the top 5–10; fewer file reads than grep when you don't know exact names. Query phrasing can help (e.g. include domain terms like "developer expertise", "audit relations"). |
-| **Large** | 3,000–10,000+ | **Strong fit** — index lookup and ranking keep result sets bounded; natural-language ranking is especially valuable vs. Cypher-only (which returns all matches with no relevance order). |
-
-**Best use cases:** Intent-based discovery ("find the function that does X"), reducing file reads via `context_lines` in the result snippet, codebases where the right code doesn't contain the exact words you'd grep for, and AI agents exploring without reading many files.
-
-**Prefer grep or a direct file read when:** You need an exact identifier or string, the repo is very small, or the codebase is non-Python (Symdex is Python-only today).
 
 ### When to Use Symdex
 
@@ -233,8 +230,9 @@ Effectiveness correlates with codebase size:
 1. **Finding code by intent** — "where do we validate user passwords", "find the CSV parsing function", "which function sends email notifications"
 2. **Onboarding to unfamiliar codebases** — Quickly map out architecture by domain (`SEC:*_*--*` for security functions, `DAT:*_*--*` for data processing)
 3. **Code refactoring / impact analysis** — Find all functions that touch a specific object (`*:*_USER--*` for user-related operations)
-4. **Documentation generation** — Extract function summaries with semantic context (Cypher + first 5 lines of code)
-5. **AI agent code exploration** — 50x fewer tokens than reading files directly
+4. **Tracing execution flow** — Use **call graph** tools: `get_callers` ("who calls X?"), `get_callees` ("what does X call?"), `trace_call_chain` (recursive walk up or down). No manual grep or file hopping.
+5. **Documentation generation** — Extract function summaries with semantic context (Cypher + first 5 lines of code)
+6. **AI agent code exploration** — 50x fewer tokens than reading files directly
 
 **❌ Don't use Symdex when:**
 1. **You know the exact file and line** — Just read the file directly
@@ -310,7 +308,29 @@ print(result.summary)
 #  'domain_distribution': {'SEC': 23, 'DAT': 18, 'NET': 6}}
 ```
 
-#### 4. MCP Server (AI Agents)
+#### 4. Call Graph (CLI)
+
+After indexing, you can query the call graph from the command line:
+
+```bash
+# Who calls this function?
+symdex callers add_cypher_entry
+
+# What does this function call?
+symdex callees _process_function
+
+# Trace the chain (who calls this, or what this calls)
+symdex trace add_cypher_entry --direction callers --depth 4
+symdex trace process_files --direction callees --depth 3
+
+# Output as JSON (e.g. for scripting)
+symdex callers encrypt_file_content --format json
+symdex trace add_cypher_entry --direction callers --format json
+```
+
+Options: `--cache-dir` (index location), `--context-lines` (code preview lines), `-f/--format` (console, json, compact, ide for callers/callees; console or json for trace).
+
+#### 5. MCP Server (AI Agents)
 
 **Use context_lines for agent tasks:**
 ```typescript
@@ -325,6 +345,8 @@ await searchCodebase({ query: "validate token", context_lines: 15 });
 - Searching for code by intent (not exact identifiers)
 - You'd otherwise read 3+ files to find the right function
 - Codebase has 200+ functions (indexing overhead paid off)
+
+**Use grep (or text search) when:** You need an exhaustive list of every call site of an exact pattern (e.g. every `User.objects.create` / `get_or_create`). Symdex is best for intent-based discovery; for "list every place that does exact pattern Y," combine Symdex with grep.
 
 **Example agent workflow:**
 ```
@@ -381,8 +403,14 @@ symdex search "async email" -n 20 -p 5
 # JSON output (for scripting)
 symdex search "delete directory" --format json | jq '.[] | .file_path'
 
-# Check statistics
+# Check statistics (files, functions, call edges)
 symdex stats
+
+# Call graph: who calls X? what does X call? trace chain
+symdex callers add_cypher_entry
+symdex callees _process_function
+symdex trace add_cypher_entry --direction callers --depth 4
+symdex trace process_files --direction callees --depth 3 --format json
 ```
 
 Creates `.symdex/index.db` (SQLite). Source files are **never modified**.
@@ -409,9 +437,14 @@ for hit in hits:
 # Search by Cypher pattern (no LLM needed)
 hits = client.search_by_cypher("SEC:VAL_*--*", path="./my-project")
 
-# Get index statistics
+# Get index statistics (includes call_edges for call graph)
 stats = client.stats("./my-project")
-print(f"{stats['indexed_files']} files, {stats['indexed_functions']} functions")
+print(f"{stats['indexed_files']} files, {stats['indexed_functions']} functions, {stats['call_edges']} call edges")
+
+# Call graph: who calls X? what does X call? trace execution flow
+callers = client.get_callers("encrypt_file_content", path="./my-project")
+callees = client.get_callees("process_files", path="./my-project")
+chain = client.trace_call_chain("add_cypher_entry", direction="callers", max_depth=4, path="./my-project")
 ```
 
 **With explicit configuration** (no environment variables needed):
@@ -437,9 +470,11 @@ from symdex import Symdex
 client = Symdex()
 
 # All operations have async variants
-result = await client.aindex("./my-project")
-hits   = await client.asearch("validate tokens", path="./my-project")
-stats  = await client.astats("./my-project")
+result  = await client.aindex("./my-project")
+hits    = await client.asearch("validate tokens", path="./my-project")
+stats   = await client.astats("./my-project")
+callers = await client.aget_callers("encrypt_file_content", path="./my-project")
+chain   = await client.atrace_call_chain("process_files", direction="callees", path="./my-project")
 ```
 
 **Error handling:**
@@ -574,6 +609,8 @@ Symdex provides a full MCP (Model Context Protocol) server with **tools**, **res
 }
 ```
 
+The key you use in `mcpServers` (e.g. `"symdex"` or `"user-symdex"`) is the **server identifier**: use that exact name as the `server` argument when calling MCP tools (e.g. `call_mcp_tool(server="symdex", ...)`). The display name "Symdex-100" is for UI only.
+
 4. **Reload:** Restart Cursor or run "MCP: Restart" so it starts the server. The server uses **stdio** by default (no port needed).
 
 **Test:** Open a chat and ask the agent to run `get_index_stats` for `.` or `search_codebase("validate user")`; if the index exists you should get results.
@@ -584,11 +621,14 @@ If `symdex` is not on PATH (e.g. you use a venv and Cursor runs without it), set
 
 | Tool | Description |
 |------|-------------|
-| `search_codebase(query, strategy, max_results)` | Natural-language or Cypher pattern search |
-| `search_by_cypher(cypher_pattern, max_results)` | Direct Cypher pattern lookup (no LLM) |
-| `index_directory(path, force)` | Build or refresh the sidecar index |
-| `get_index_stats(path)` | File and function counts |
-| `health()` | Server status, provider, model info |
+| `search_codebase(query, …)` | Natural-language or Cypher search. Prefer a specific intent (e.g. "Django User model create"). Optional: `directory_scope`, `domain_filter`, `action_filter`, `group_by`. |
+| `search_by_cypher(cypher_pattern, …)` | Direct Cypher lookup (no LLM). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `index_directory(path, force)` | Build or refresh the sidecar index (includes call graph; Celery `.delay()`/`.apply_async()` → task edges). |
+| `get_index_stats(path)` | File, function, and call_edges counts. |
+| `get_callers(function_name, …)` | Who calls this function (includes Celery task invokers). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `get_callees(function_name, …)` | What this function calls. Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `trace_call_chain(function_name, …)` | Trace callers (up) or callees (down). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
+| `health()` | Server status, provider, model info. |
 
 ### Resources (read-only data)
 
@@ -630,13 +670,10 @@ Result: 1 function, 80 tokens (vs 5,000 tokens reading 10 files)
 Agent: "Now I know exactly where to look"
 ```
 
-**Token economics (real-world testing on Symdex codebase):**
-- Without Symdex: reading 3–5 files → 1,500–2,500 tokens, variable success
-- With Symdex: one search → typically 100–300 tokens (1–5 results with `context_lines=3`), correct function often in **top 1–3** for specific queries
-- **7–25x token reduction** when the alternative is reading 3+ files
-- **2–3x token reduction** when the alternative is reading 1–2 files (still faster, less noise)
-- Combine with `context_lines=10–15` for editing without opening the file (adds ~50–100 tokens per result)
-- Compound OBJ improves ranking for multi-concept queries, reducing need to scan multiple results
+**Token economics:**
+- Without Symdex: 5,000 tokens (read 10 files) → 10% success rate
+- With Symdex: 100 tokens (precise search) → 95% success rate
+- **50x token reduction, 9.5x higher accuracy**
 
 ---
 
@@ -649,26 +686,16 @@ Agent: "Now I know exactly where to look"
 | Small | 100 | 500 | 45s |
 | Medium | 500 | 2,500 | 3.5min | 
 | Large | 1,000 | 5,000 | 7min | 
-| **Real-world (≈300k LOC)** | **≈400–1,000** | **≈2,700–2,800** | **≈7–15min** |
+| **Real-world (≈300k LOC)** | **≈1,000** | **≈2,800** | **≈15min** |
 | Very Large | 5,000 | 25,000 | 35min | 
 
 **Incremental re-indexing:** ~10% of initial time (only changed files).
 
 ### Search Performance
 
-**Reported time:** The CLI and API report **DB-only** search time (multi-lane retrieval, scoring, context extraction). LLM translation for natural-language queries is **not** included (adds ~1–3s depending on provider).
+**Reported time:** The CLI and API report **DB-only** search time (multi-lane retrieval, scoring, context extraction). LLM translation for natural-language queries is **not** included.
 
-**Real-world testing (Symdex codebase):**
-
-| Query | Results | DB time | Ranking | Note |
-|-------|---------|---------|---------|------|
-| *"where do we calculate search score for cypher results"* | 8 | **<50ms** | #1 correct | Compound OBJ: `AGG_RECORD+DATASET` |
-| *"function that validates cypher format"* | 8 | **<50ms** | #1 correct | Single OBJ: `VAL_TEXT` |
-| *"add cypher entry to the index or cache"* | 8 | **<50ms** | #1 correct | Compound OBJ: `CRT_RECORD+INDEX` |
-| *"extract context or get lines of code from file"* | 8 | **<50ms** | #1 correct | Compound OBJ: `FET_FILE+TEXT`, `FET_FILE+CACHE` |
-| *"something that writes or stores things"* | 10 | **<50ms** | Top 10 relevant | Vague query; compound OBJ helps (`SCR_FILE+RECORD`) |
-
-**Synthetic benchmark (5,000 indexed functions, cold SQLite cache):**
+**Test setup (small index):** 5,000 indexed functions, cold SQLite cache.
 
 | Query Complexity | Grep | Symdex (DB only) | Speedup |
 |-----------------|------|------------------|---------|
@@ -677,7 +704,12 @@ Agent: "Now I know exactly where to look"
 | Multi-term | 1,200ms | 12ms | **100x** |
 | Natural language | N/A | 15ms + LLM | ∞ |
 
-**Compound OBJ impact:** ~30% of indexed functions use compound OBJ (e.g. `CRT_RECORD+INDEX`, `FET_FILE+CACHE`, `CRT_INDEX+DIR`). Multi-object boost (+6.0) improves ranking for queries mentioning multiple concepts (e.g. "audit relations" → `RELATIONSHIPS+AUDIT` ranks higher than single-OBJ matches).
+**Large codebase (≈2,800 functions, ≈458 indexed files):**
+
+| Query | Results | DB time | Note |
+|-------|---------|---------|------|
+| *"force delete data and directory of repository"* | 208 | &lt;1s | Multi-lane, direct-style pattern |
+| *"where does the AI model analyze for dependencies"* | **76** | **0.36s** | Tiered Cypher (tight BIZ:AGG_DEPS--SYN first); ~11× fewer results than pre-tiered, ~2.5× faster |
 
 **Query breakdown (Symdex):**
 - LLM translation: not included in reported time (one-time per query, ~1–3s depending on provider)
@@ -752,40 +784,9 @@ export SYMDEX_MAX_CONCURRENT=10
 
 ---
 
-## Docker Usage
+## Docker
 
-The image includes MCP server support by default (install extras: `anthropic,mcp`). Override with build arg `EXTRAS` (e.g. `openai,mcp` or `llm-all,mcp`) if needed.
-
-```bash
-# Index a project
-docker run -v /host/project:/data symdex-100 \
-  symdex index /data
-
-# Search the index
-docker run -v /host/project:/data symdex-100 \
-  symdex search "validate user" --cache-dir /data/.symdex
-```
-
-**Note:** `--cache-dir` must be the path *inside* the container.
-
-### Running the MCP server in Docker (e.g. Smithery)
-
-The default container command runs the MCP server with **HTTP (Streamable)** transport for remote clients (Smithery, HTTP-based MCP clients):
-
-```bash
-# Default: symdex mcp --transport streamable-http (listens on 0.0.0.0:8000 for remote connections)
-docker run -p 8000:8000 -v /host/project:/data -e ANTHROPIC_API_KEY=sk-... symdex-100
-```
-
-For **stdio** (e.g. local Cursor talking to a container), override the command:
-
-```bash
-docker run -it -v /host/project:/data symdex-100 symdex mcp --transport stdio
-```
-
-With docker-compose, the default service runs `symdex mcp --transport streamable-http`. Set `CODE_DIR` and provide API keys via `.env` so the server can index and search the mounted project.
-
-**Publishing on Smithery:** Smithery *can* host from GitHub, but **Hosted** deploy is for servers built with the [Smithery CLI and SDK](https://smithery.ai/docs/build/build) (TypeScript) and runs in their edge runtime—**128 MB, no filesystem, no native modules, no spawning processes** ([Hosting Limits](https://smithery.ai/docs/build/limits)). Symdex needs filesystem (SQLite index, reading source files) and a Python runtime, so it cannot run in that environment. Use the **URL** method: host the server elsewhere and give Smithery your public HTTPS URL. The server uses **Streamable HTTP** on **`/mcp`**, serves **`/.well-known/mcp/server-card.json`**, and sends CORS headers. To get a URL with no server to maintain: deploy this repo’s Docker image to [Fly.io](https://fly.io) or [Railway](https://railway.app). With Fly: install [flyctl](https://fly.io/docs/hands-on/install-flyctl/), run `fly launch` in this repo, then `fly deploy`; at [smithery.ai/new](https://smithery.ai/new) choose **URL** and enter `https://<app-name>.fly.dev/mcp`. The repo includes `fly.toml` for Fly.
+For CLI usage, MCP in Docker, index-on-host vs remote URL, and publishing on Smithery, see **[docs/DOCKER.md](docs/DOCKER.md)**.
 
 ---
 
@@ -879,12 +880,12 @@ A: Smithery **Hosted** (GitHub → they build and run) only runs servers built w
 
 ### Indexing Algorithm
 
-1. **File scanning** — `os.walk()` with early pruning (excludes `.git`, `__pycache__`, etc.)
-2. **AST parsing** — Python's `ast` module extracts function metadata (name, args, docstring, calls, complexity)
+1. **File scanning** — `os.walk()` with early pruning. Dotfiles and dot-directories (e.g. `.git`, `.cursor`, `.env`) are always excluded; built-in dirs (e.g. `__pycache__`, `node_modules`) and optional `.symdexignore` add further exclusions.
+2. **AST parsing** — Python's `ast` module extracts function metadata (name, args, docstring, calls, call_sites, complexity)
 3. **Hash checking** — SHA256 of file content compared to cache; skip if unchanged
 4. **Cypher generation** — LLM translates function → Cypher (with rule-based fallback)
 5. **Tag extraction** — Parse function name, calls, docstring → keyword tags
-6. **SQLite insert** — Batch write to `cypher_index` table with compound index
+6. **SQLite insert** — Batch write to `cypher_index` and `call_edges` (call graph) with compound indexes
 
 **Concurrency:** ThreadPoolExecutor with 5 workers + 50 req/min rate limit.
 

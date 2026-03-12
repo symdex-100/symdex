@@ -1,9 +1,9 @@
 """
 Symdex-100 Core Engine
 
-Python-focused code analysis, caching, Cypher generation, and search scoring.
-Uses Python's AST module for precise function extraction.
-Production-grade with comprehensive error handling and logging.
+Multi-language code analysis (Python, JavaScript/TypeScript), caching,
+Cypher generation, and search scoring. Uses Python's AST for Python and
+tree-sitter for JS/TS (built-in). Production-grade with comprehensive error handling and logging.
 """
 
 import ast
@@ -12,23 +12,39 @@ import logging
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from symdex.core.config import Config, CypherSchema, Prompts, SymdexConfig
 
-# NOTE: Module-level logging.basicConfig() removed (v1.1).
-# Application code (CLI, MCP server) is responsible for configuring logging.
-# This avoids side effects when symdex is imported as a library.
 logger = logging.getLogger(__name__)
+
+# File extensions that use the JS/TS tree-sitter extractor.
+JS_TS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx"})
 
 
 # =============================================================================
 # Data Models
 # =============================================================================
+
+@dataclass
+class CallSite:
+    """A function call detected within a function body via AST analysis.
+
+    Stored at index time to build the call graph. Each instance represents
+    one call expression (e.g. ``encrypt_file_content(data)``).
+    """
+    callee_name: str
+    """Name of the called function (simple name or attribute name)."""
+    line: int
+    """Source line number where the call occurs."""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
 
 @dataclass
 class FunctionMetadata:
@@ -43,7 +59,9 @@ class FunctionMetadata:
     docstring: Optional[str]
     complexity: int  # Cyclomatic complexity approximation
     language: str = "Python"  # Human-readable language name
-    
+    call_sites: List[CallSite] = field(default_factory=list)
+    """Detailed call sites with line numbers (for call graph). Populated by AST analysis."""
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -166,10 +184,13 @@ class CodeAnalyzer:
     @staticmethod
     def extract_functions(source_code: str, file_path: str = "<string>") -> List[FunctionMetadata]:
         """
-        Extract all function / method definitions from Python source code.
-        
-        Uses Python's AST module for accurate, robust extraction.
+        Extract all function / method definitions from source code.
+
+        Dispatches by file extension: Python (ast) or JavaScript/TypeScript (tree-sitter).
         """
+        ext = Path(file_path).suffix.lower()
+        if ext in JS_TS_EXTENSIONS:
+            return CodeAnalyzer._extract_js_ts(source_code, file_path)
         return CodeAnalyzer._extract_python_ast(source_code, file_path)
 
     @staticmethod
@@ -225,14 +246,35 @@ class CodeAnalyzer:
 
         args = [arg.arg for arg in node.args.args]
 
-        calls = []
+        # Extract calls with line numbers for call graph
+        call_sites_list: List[CallSite] = []
+        calls_set: set = set()
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
+                callee_name = None
                 if isinstance(child.func, ast.Name):
-                    calls.append(child.func.id)
+                    callee_name = child.func.id
                 elif isinstance(child.func, ast.Attribute):
-                    calls.append(child.func.attr)
-        calls = list(set(calls))[:10]
+                    # For task managers: task.delay() / task.apply_async() — treat task as callee
+                    if child.func.attr in ("delay", "apply_async"):
+                        value = child.func.value
+                        if isinstance(value, ast.Name):
+                            callee_name = value.id
+                        elif isinstance(value, ast.Attribute):
+                            callee_name = value.attr  # e.g. tasks.validate_task -> validate_task
+                        else:
+                            callee_name = child.func.attr
+                    else:
+                        callee_name = child.func.attr
+                if callee_name:
+                    call_sites_list.append(CallSite(
+                        callee_name=callee_name,
+                        line=child.lineno,
+                    ))
+                    calls_set.add(callee_name)
+
+        # Backward-compatible calls list (deduped, max 10, used for tag generation)
+        calls = list(calls_set)[:10]
 
         imports: List[str] = []
         docstring = ast.get_docstring(node)
@@ -253,7 +295,22 @@ class CodeAnalyzer:
             docstring=docstring,
             complexity=complexity,
             language="Python",
+            call_sites=call_sites_list,
         )
+
+    # ── JavaScript/TypeScript (tree-sitter) ───────────────────────
+
+    @staticmethod
+    def _extract_js_ts(source_code: str, file_path: str) -> List[FunctionMetadata]:
+        """Extract functions from JavaScript/TypeScript using tree-sitter."""
+        try:
+            from symdex.core._js_ts_parser import parse_js_ts_functions
+            return parse_js_ts_functions(source_code, file_path)
+        except ImportError as e:
+            logger.warning(
+                "tree-sitter-language-pack not available; JS/TS files will be skipped: %s", e
+            )
+            return []
 
     # ── Helpers ───────────────────────────────────────────────────
 
@@ -335,14 +392,37 @@ class CypherCache:
                 complexity TEXT,
                 indexed_at TIMESTAMP NOT NULL,
                 relative_path TEXT,
+                language TEXT DEFAULT 'Python',
                 FOREIGN KEY (file_path) REFERENCES indexed_files (file_path) ON DELETE CASCADE
             )
         """)
+        # Backfill language column for existing DBs created before multi-language support
+        try:
+            conn.execute("ALTER TABLE cypher_index ADD COLUMN language TEXT DEFAULT 'Python'")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
         # Create indexes for fast searching
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cypher ON cypher_index(cypher)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON cypher_index(file_path)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_function_name ON cypher_index(function_name)")
+
+        # Call graph: edges between caller and callee functions (built at index time)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS call_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller_file TEXT NOT NULL,
+                caller_name TEXT NOT NULL,
+                caller_line INTEGER NOT NULL,
+                callee_name TEXT NOT NULL,
+                call_line INTEGER,
+                FOREIGN KEY (caller_file) REFERENCES indexed_files (file_path) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_name, caller_file)")
         conn.commit()
 
     def get_file_hash(self, file_path: Path) -> str:
@@ -374,20 +454,29 @@ class CypherCache:
 
     def add_cypher_entry(self, file_path: Path, function_name: str, line_start: int,
                          line_end: int, cypher: str, tags: List[str],
-                         signature: str, complexity: str, relative_path: str | None = None):
+                         signature: str, complexity: str, relative_path: str | None = None,
+                         language: str = "Python"):
         """Add a Cypher entry to the index. relative_path is path relative to project root (portable across machines)."""
         conn = self._get_connection()
         now_iso = datetime.now().isoformat()
         conn.execute("""
             INSERT INTO cypher_index
-            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at, relative_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (file_path, function_name, line_start, line_end, cypher, tags, signature, complexity, indexed_at, relative_path, language)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(file_path), function_name, line_start, line_end, cypher,
-              ",".join(tags), signature, complexity, now_iso, relative_path))
+              ",".join(tags), signature, complexity, now_iso, relative_path, language))
         conn.commit()
 
-    def search_by_cypher(self, pattern: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search for functions matching a Cypher pattern (supports wildcards). Also matches compound OBJ (e.g. RELATIONSHIPS+AUDIT when pattern has RELATIONSHIPS)."""
+    @staticmethod
+    def _path_prefix_like(scope: str) -> str:
+        """Normalize directory_scope to a SQL LIKE pattern. relative_path is stored with /."""
+        s = scope.strip().replace("\\", "/").rstrip("/")
+        return f"{s}/%" if s else "%"
+
+    def search_by_cypher(self, pattern: str, limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for functions matching a Cypher pattern (supports wildcards). Also matches compound OBJ (e.g. RELATIONSHIPS+AUDIT when pattern has RELATIONSHIPS).
+        When path_prefix is set, only rows whose relative_path starts with that prefix are returned (scoped search).
+        """
         sql_pattern = pattern.replace("*", "%")
         # When pattern has no wildcard in OBJ (e.g. DAT:CRT_RELATIONSHIPS--SYN), also match compound OBJ (RELATIONSHIPS+AUDIT)
         patterns_to_try = [sql_pattern]
@@ -399,18 +488,24 @@ class CypherCache:
                 if "+" not in act_obj and "%" not in act_obj:
                     compound_pattern = f"{parts[0]}:{act_obj}%--{pat}".replace("*", "%")
                     patterns_to_try.append(compound_pattern)
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
         seen = set()
         results = []
+        where_extra = " AND (relative_path LIKE ? OR (relative_path IS NULL AND file_path LIKE ?))" if path_like else ""
+        params_extra = (path_like, path_like) if path_like else ()
         for p in patterns_to_try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT file_path, function_name, line_start, line_end, cypher, tags, signature, relative_path
                 FROM cypher_index
-                WHERE cypher LIKE ?
+                WHERE cypher LIKE ?""" + where_extra + """
                 ORDER BY indexed_at DESC
                 LIMIT ?
-            """, (p, limit))
+            """,
+                (p,) + params_extra + (limit,),
+            )
             for row in cursor.fetchall():
                 key = (row["file_path"], row["function_name"], row["line_start"])
                 if key not in seen:
@@ -423,33 +518,44 @@ class CypherCache:
         conn.row_factory = None
         return results
 
-    def search_by_tags(self, tag: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search for functions by tag."""
+    def search_by_tags(self, tag: str, limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for functions by tag. When path_prefix is set, only rows under that subtree are returned."""
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
-        cursor = conn.execute("""
-            SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
-            FROM cypher_index
-            WHERE tags LIKE ?
-            LIMIT ?
-        """, (f"%{tag}%", limit))
+        if path_like:
+            cursor = conn.execute("""
+                SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
+                FROM cypher_index
+                WHERE tags LIKE ? AND (relative_path LIKE ? OR (relative_path IS NULL AND file_path LIKE ?))
+                LIMIT ?
+            """, (f"%{tag}%", path_like, path_like, limit))
+        else:
+            cursor = conn.execute("""
+                SELECT file_path, function_name, line_start, line_end, cypher, tags, relative_path
+                FROM cypher_index
+                WHERE tags LIKE ?
+                LIMIT ?
+            """, (f"%{tag}%", limit))
         results = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return results
 
-    def search_by_name(self, keywords: List[str], limit: int = 50) -> List[Dict[str, Any]]:
+    def search_by_name(self, keywords: List[str], limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Search for functions whose name contains any of the given keywords.
-
-        Uses SQL LIKE with wildcard wrapping so ``delete`` matches
-        ``_delete_directory_tree_and_relations``.  The function_name column
-        is already indexed (``idx_function_name``) for fast lookups.
+        When path_prefix is set, only rows under that subtree are returned.
         """
         if not keywords:
             return []
 
         conditions = " OR ".join(["function_name LIKE ?"] * len(keywords))
         params: list = [f"%{kw}%" for kw in keywords]
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
+        if path_like:
+            conditions += " AND (relative_path LIKE ? OR (relative_path IS NULL AND file_path LIKE ?))"
+            params.extend([path_like, path_like])
+        params.append(limit)
 
         conn = self._get_connection()
         conn.row_factory = sqlite3.Row
@@ -460,13 +566,13 @@ class CypherCache:
             WHERE {conditions}
             ORDER BY indexed_at DESC
             LIMIT ?
-        """, params + [limit])
+        """, params)
         results = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return results
 
     def get_stats(self) -> Dict[str, int]:
-        """Get indexing statistics."""
+        """Get indexing statistics (files, functions, and call graph edges)."""
         conn = self._get_connection()
         cursor = conn.execute("SELECT COUNT(*) FROM indexed_files")
         file_count = cursor.fetchone()[0]
@@ -474,15 +580,116 @@ class CypherCache:
         cursor = conn.execute("SELECT COUNT(*) FROM cypher_index")
         function_count = cursor.fetchone()[0]
 
+        cursor = conn.execute("SELECT COUNT(*) FROM call_edges")
+        edge_count = cursor.fetchone()[0]
+
         return {
             "indexed_files": file_count,
             "indexed_functions": function_count,
+            "call_edges": edge_count,
         }
 
+    # ── Call Graph ────────────────────────────────────────────────
+
+    def add_call_edges(self, caller_file: Path, caller_name: str,
+                       caller_line: int, call_sites: List) -> None:
+        """Store call edges extracted from a function's AST.
+
+        Each element in *call_sites* must expose ``callee_name`` and ``line``
+        (either as attributes or dict keys).  Duplicate edges (same
+        caller → callee within one function) are deduplicated before insert.
+        """
+        if not call_sites:
+            return
+        conn = self._get_connection()
+        seen: set = set()
+        for site in call_sites:
+            callee = site.callee_name if hasattr(site, "callee_name") else site["callee_name"]
+            line = site.line if hasattr(site, "line") else site.get("line")
+            key = (caller_name, callee)
+            if key in seen:
+                continue
+            seen.add(key)
+            conn.execute("""
+                INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_line)
+                VALUES (?, ?, ?, ?, ?)
+            """, (str(caller_file), caller_name, caller_line, callee, line))
+        conn.commit()
+
+    def get_callers(self, function_name: str, limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Find indexed functions that call *function_name*.
+        When path_prefix is set, only callers whose relative_path is under that subtree are returned.
+        """
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        if path_like:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci
+                  ON ci.file_path = ce.caller_file AND ci.function_name = ce.caller_name
+                WHERE ce.callee_name = ? AND (ci.relative_path LIKE ? OR (ci.relative_path IS NULL AND ci.file_path LIKE ?))
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, path_like, path_like, limit))
+        else:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci
+                  ON ci.file_path = ce.caller_file AND ci.function_name = ce.caller_name
+                WHERE ce.callee_name = ?
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, limit))
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return results
+
+    def get_callees(self, function_name: str, caller_file: str | None = None,
+                    limit: int = 50, path_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Find indexed functions called by *function_name*.
+        When path_prefix is set, only callees under that subtree are returned.
+        """
+        path_like = CypherCache._path_prefix_like(path_prefix) if path_prefix else None
+        path_cond = " AND (ci.relative_path LIKE ? OR (ci.relative_path IS NULL AND ci.file_path LIKE ?))" if path_like else ""
+        path_params = (path_like, path_like) if path_like else ()
+        conn = self._get_connection()
+        conn.row_factory = sqlite3.Row
+        if caller_file:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci ON ci.function_name = ce.callee_name
+                WHERE ce.caller_name = ? AND ce.caller_file = ?""" + path_cond + """
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name, caller_file) + path_params + (limit,))
+        else:
+            cursor = conn.execute("""
+                SELECT DISTINCT ci.file_path, ci.function_name, ci.line_start, ci.line_end,
+                       ci.cypher, ci.tags, ci.signature, ci.relative_path
+                FROM call_edges ce
+                JOIN cypher_index ci ON ci.function_name = ce.callee_name
+                WHERE ce.caller_name = ?""" + path_cond + """
+                ORDER BY ci.file_path, ci.line_start
+                LIMIT ?
+            """, (function_name,) + path_params + (limit,))
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return results
+
+    # ── Cleanup ────────────────────────────────────────────────────
+
     def clear_file_entries(self, file_path: Path):
-        """Remove all entries for a specific file."""
+        """Remove all entries for a specific file (cypher index + call edges)."""
         conn = self._get_connection()
         conn.execute("DELETE FROM cypher_index WHERE file_path = ?", (str(file_path),))
+        conn.execute("DELETE FROM call_edges WHERE caller_file = ?", (str(file_path),))
         conn.execute("DELETE FROM indexed_files WHERE file_path = ?", (str(file_path),))
         conn.commit()
 
@@ -669,6 +876,7 @@ class CypherGenerator:
         self._provider_name = provider
         # Lazy — created on first actual LLM call via _ensure_llm()
         self.llm: LLMProvider | None = None
+        self._llm_unavailable_logged = False
 
     # Maximum length of a valid Cypher string (e.g. "SEC:VAL_HTTPREQUEST--ASY").
     # Responses longer than this that don't validate are treated as
@@ -711,21 +919,29 @@ class CypherGenerator:
         if getattr(cfg, "cypher_fallback_only", False):
             return self._generate_fallback_cypher(metadata)
 
-        # Fast-path: known boilerplate methods almost always get SKIP; avoid LLM call.
-        _BOILERPLATE_NAMES = frozenset({
+        # Fast-path: names that are not classifiable or would waste an LLM call.
+        _SKIP_NAMES = frozenset({
             "setUp", "tearDown", "setUpClass", "tearDownClass", "setUpModule", "tearDownModule",
             "__init__", "__new__", "__enter__", "__exit__", "__repr__", "__str__",
+            "<anonymous>",  # JS/TS arrow functions, callbacks, etc.
         })
-        if metadata.name in _BOILERPLATE_NAMES:
-            logger.debug(f"Skip LLM for boilerplate '{metadata.name}'")
+        if metadata.name in _SKIP_NAMES:
+            logger.debug(f"Skip LLM for '{metadata.name}' (boilerplate or anonymous)")
+            return None
+        # Symbol-only or minified names (e.g. $$, $) — skip without calling LLM.
+        if not metadata.name or not any(c.isalpha() for c in metadata.name):
+            logger.debug(f"Skip LLM for '{metadata.name}' (not a classifiable identifier)")
             return None
 
         for attempt in range(1, cfg.retry_attempts + 1):
             try:
+                code_fence = metadata.language.lower()  # python, javascript, typescript
                 cypher = self._ensure_llm().complete(
                     system=Prompts.CYPHER_GENERATION_SYSTEM,
                     user_message=Prompts.CYPHER_GENERATION_USER.format(
                         code=function_code,
+                        language=metadata.language,
+                        code_fence=code_fence,
                     ),
                     max_tokens=cfg.llm_max_tokens,
                     temperature=cfg.llm_temperature,
@@ -735,9 +951,9 @@ class CypherGenerator:
 
                 # ── Explicit SKIP: LLM says the code is not classifiable ──
                 if stripped.upper().startswith("SKIP"):
-                    logger.info(
-                        f"LLM returned SKIP for '{metadata.name}' — "
-                        "code fragment is not a classifiable function."
+                    logger.debug(
+                        "LLM returned SKIP for '%s' — code fragment not classifiable",
+                        metadata.name,
                     )
                     return None
 
@@ -762,6 +978,15 @@ class CypherGenerator:
                     f"Invalid Cypher on attempt {attempt}/{cfg.retry_attempts}: "
                     f"'{stripped}' for {metadata.name}"
                 )
+            except (ImportError, ModuleNotFoundError) as e:
+                # LLM provider or dependency (e.g. jiter) missing — don't retry or spam logs
+                if not getattr(self, "_llm_unavailable_logged", False):
+                    self._llm_unavailable_logged = True
+                    logger.warning(
+                        "LLM unavailable (%s). Using rule-based fallback for all functions.",
+                        e,
+                    )
+                return self._generate_fallback_cypher(metadata)
             except Exception as e:
                 logger.warning(
                     f"API error on attempt {attempt}/{cfg.retry_attempts} "
@@ -809,6 +1034,14 @@ class CypherGenerator:
                 patterns = self._parse_tiered_cypher_response(raw)
                 if patterns:
                     return patterns
+            except (ImportError, ModuleNotFoundError) as e:
+                if not getattr(self, "_llm_unavailable_logged", False):
+                    self._llm_unavailable_logged = True
+                    logger.warning(
+                        "LLM unavailable (%s). Using keyword-based query translation.",
+                        e,
+                    )
+                return [CypherGenerator._keyword_based_translation(natural_query)]
             except Exception as e:
                 if attempt >= cfg.retry_attempts:
                     logger.error(
@@ -962,15 +1195,64 @@ class CypherGenerator:
 # Utility Functions
 # =============================================================================
 
+SYMDEXIGNORE_FILENAME = ".symdexignore"
+
+
+def load_symdexignore(root_path: Path) -> List[str]:
+    """
+    Read ignore patterns from ``.symdexignore`` at the index root.
+
+    Returns a list of non-empty, stripped lines; lines starting with ``#``
+    and blank lines are skipped. Patterns are used to exclude files and
+    directories when scanning (see :func:`_path_matches_ignore`).
+    """
+    ignore_file = Path(root_path).resolve() / SYMDEXIGNORE_FILENAME
+    if not ignore_file.is_file():
+        return []
+    patterns: List[str] = []
+    try:
+        for line in ignore_file.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                patterns.append(s)
+    except OSError as e:
+        logger.warning("Could not read %s: %s", ignore_file, e)
+    return patterns
+
+
+def _path_matches_ignore(rel_path: str, patterns: List[str]) -> bool:
+    """
+    Return True if ``rel_path`` (forward slashes, relative to index root)
+    matches any ignore pattern. Supports simple names (e.g. ``node_modules``),
+    path prefixes (e.g. ``frontend/dist``), and fnmatch globs (e.g. ``*.min.js``).
+    """
+    import fnmatch
+
+    if not patterns:
+        return False
+    norm = rel_path.replace("\\", "/")
+    for p in patterns:
+        p_norm = p.replace("\\", "/").rstrip("/")
+        if "*" in p or "?" in p:
+            if fnmatch.fnmatch(norm, p) or fnmatch.fnmatch(norm, p_norm + "/*"):
+                return True
+        else:
+            if norm == p_norm or norm.endswith("/" + p_norm) or norm.startswith(p_norm + "/"):
+                return True
+    return False
+
+
 def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[Path]:
     """
-    Recursively scan for Python source files (.py).
+    Recursively scan for source files (Python, JavaScript/TypeScript by default).
 
     Uses :func:`os.walk` with **early directory pruning** so that
     excluded subtrees (e.g. ``.git/``, ``__pycache__/``) are never
     entered — a significant speedup on large repositories.
 
-    Respects ``config.target_extensions`` and ``config.exclude_dirs``.
+    Respects ``config.target_extensions`` (default: .py, .js, .jsx, .ts, .tsx),
+    ``config.exclude_dirs``, and patterns from ``.symdexignore`` in the root.
+    Dotfiles and dot-directories (e.g. ``.git``, ``.cursor``, ``.env``) are always excluded.
     """
     import os
 
@@ -979,14 +1261,29 @@ def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[
     exclude = cfg.exclude_dirs            # frozenset — O(1) lookups
     extensions = cfg.target_extensions     # frozenset — O(1) lookups
     max_bytes = cfg.max_file_size_mb * 1024 * 1024
+    root_resolved = Path(root_path).resolve()
+    ignore_patterns = load_symdexignore(root_resolved)
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         # ── Prune excluded directories IN-PLACE so os.walk never
         #    descends into them.  Modifying dirnames[:] is the
         #    documented way to control os.walk traversal.
-        dirnames[:] = [d for d in dirnames if d not in exclude]
+        def _dir_ignored(d: str) -> bool:
+            if d.startswith("."):
+                return True
+            if d in exclude:
+                return True
+            try:
+                rel = (Path(dirpath) / d).resolve().relative_to(root_resolved).as_posix()
+                return _path_matches_ignore(rel, ignore_patterns)
+            except ValueError:
+                return False
+
+        dirnames[:] = [d for d in dirnames if not _dir_ignored(d)]
 
         for fname in filenames:
+            if fname.startswith("."):
+                continue
             # Fast extension check (splitext is C-level, frozenset lookup is O(1))
             _, ext = os.path.splitext(fname)
             if ext not in extensions:
@@ -996,6 +1293,10 @@ def scan_directory(root_path: Path, config: SymdexConfig | None = None) -> List[
             try:
                 size = os.path.getsize(full)
             except OSError:
+                continue
+
+            rel_path = Path(full).resolve().relative_to(root_resolved).as_posix()
+            if _path_matches_ignore(rel_path, ignore_patterns):
                 continue
 
             if size <= max_bytes:

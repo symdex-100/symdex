@@ -16,6 +16,9 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
+# Extensions that trigger re-index when changed (matches config.target_extensions).
+_WATCHED_EXTENSIONS = (".py", ".js", ".jsx", ".ts", ".tsx")
+
 
 class AutoReindexer:
     """Automatic re-indexation with file watching and scheduling."""
@@ -68,17 +71,20 @@ class AutoReindexer:
                 class ChangeHandler(FileSystemEventHandler):
                     def __init__(self, reindexer):
                         self.reindexer = reindexer
-                    
+
+                    def _should_trigger(self, path: str) -> bool:
+                        return any(path.endswith(ext) for ext in _WATCHED_EXTENSIONS)
+
                     def on_modified(self, event):
-                        if not event.is_directory and event.src_path.endswith('.py'):
+                        if not event.is_directory and self._should_trigger(event.src_path):
                             self.reindexer._pending_reindex = True
-                    
+
                     def on_created(self, event):
-                        if not event.is_directory and event.src_path.endswith('.py'):
+                        if not event.is_directory and self._should_trigger(event.src_path):
                             self.reindexer._pending_reindex = True
-                    
+
                     def on_deleted(self, event):
-                        if not event.is_directory and event.src_path.endswith('.py'):
+                        if not event.is_directory and self._should_trigger(event.src_path):
                             self.reindexer._pending_reindex = True
                 
                 observer = Observer()
@@ -134,17 +140,18 @@ class AutoReindexer:
             logger.error(f"Re-index failed: {e}")
     
     def _get_directory_snapshot(self) -> str:
-        """Get hash of all .py files for change detection (polling fallback)."""
+        """Get hash of all indexed source files for change detection (polling fallback)."""
         try:
             hasher = hashlib.sha256()
-            for py_file in sorted(self.root_dir.rglob('*.py')):
-                try:
-                    if any(part.startswith('.') for part in py_file.parts):
-                        continue  # Skip hidden dirs
-                    hasher.update(str(py_file).encode())
-                    hasher.update(str(py_file.stat().st_mtime).encode())
-                except Exception:
-                    pass
+            for ext in _WATCHED_EXTENSIONS:
+                for path in sorted(self.root_dir.rglob(f"*{ext}")):
+                    try:
+                        if any(part.startswith('.') for part in path.parts):
+                            continue  # Skip hidden dirs
+                        hasher.update(str(path).encode())
+                        hasher.update(str(path.stat().st_mtime).encode())
+                    except Exception:
+                        pass
             return hasher.hexdigest()
         except Exception as e:
             logger.warning(f"Could not create directory snapshot: {e}")

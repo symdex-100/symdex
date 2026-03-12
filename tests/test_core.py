@@ -20,6 +20,7 @@ from symdex.core.engine import (
     _create_provider,
     _PROVIDER_REGISTRY,
     calculate_search_score,
+    load_symdexignore,
     scan_directory,
 )
 
@@ -65,6 +66,26 @@ class TestCodeAnalyzerPython:
         bad_code = "def broken(\n"
         funcs = CodeAnalyzer.extract_functions(bad_code, "bad.py")
         assert funcs == []
+
+
+# =============================================================================
+# CodeAnalyzer — JavaScript/TypeScript (optional tree-sitter)
+# =============================================================================
+
+class TestCodeAnalyzerJsTs:
+    """JS/TS extraction (tree-sitter is a required dependency)."""
+
+    def test_extract_functions_dispatches_by_extension(self):
+        """Passing a .js path returns a list from the JS/TS extractor."""
+        funcs = CodeAnalyzer.extract_functions("function bar() {}", "file.js")
+        assert isinstance(funcs, list)
+
+    def test_extract_js_function(self):
+        """JS function is extracted via tree-sitter."""
+        funcs = CodeAnalyzer.extract_functions("function bar() { return 1; }", "file.js")
+        assert len(funcs) == 1
+        assert funcs[0].name == "bar"
+        assert funcs[0].language == "JavaScript"
 
 
 # =============================================================================
@@ -431,6 +452,60 @@ class TestScanDirectory:
     def test_empty_directory(self, tmp_path):
         files = scan_directory(tmp_path)
         assert files == []
+
+    def test_respects_symdexignore(self, tmp_path):
+        """Files and directories listed in .symdexignore are excluded from the scan."""
+        (tmp_path / "root.py").write_text("def a(): pass\n", encoding="utf-8")
+        skip_dir = tmp_path / "skip_dir"
+        skip_dir.mkdir()
+        (skip_dir / "inner.py").write_text("def b(): pass\n", encoding="utf-8")
+        (tmp_path / ".symdexignore").write_text(
+            "# ignore this dir\nskip_dir\n",
+            encoding="utf-8",
+        )
+        files = scan_directory(tmp_path)
+        paths = [f.relative_to(tmp_path).as_posix() for f in files]
+        assert "root.py" in paths
+        assert "skip_dir/inner.py" not in paths
+
+    def test_respects_symdexignore_file_pattern(self, tmp_path):
+        """Glob patterns in .symdexignore exclude matching files."""
+        (tmp_path / "keep.py").write_text("def a(): pass\n", encoding="utf-8")
+        (tmp_path / "generated.min.js").write_text("x();\n", encoding="utf-8")
+        (tmp_path / ".symdexignore").write_text("*.min.js\n", encoding="utf-8")
+        files = scan_directory(tmp_path)
+        names = [f.name for f in files]
+        assert "keep.py" in names
+        assert "generated.min.js" not in names
+
+    def test_ignores_dotfiles_and_dot_directories(self, tmp_path):
+        """Dot-prefixed files and directories are always excluded."""
+        (tmp_path / "app.py").write_text("def a(): pass\n", encoding="utf-8")
+        (tmp_path / ".env").write_text("KEY=1\n", encoding="utf-8")
+        (tmp_path / ".cursor").mkdir()
+        (tmp_path / ".cursor" / "settings.json").write_text("{}", encoding="utf-8")
+        files = scan_directory(tmp_path)
+        names = [f.name for f in files]
+        assert "app.py" in names
+        assert not any(".env" in str(f) or ".cursor" in str(f) for f in files)
+
+
+# =============================================================================
+# load_symdexignore
+# =============================================================================
+
+class TestLoadSymdexignore:
+    """Parsing of .symdexignore file."""
+
+    def test_returns_empty_when_no_file(self, tmp_path):
+        assert load_symdexignore(tmp_path) == []
+
+    def test_returns_patterns_skipping_comments_and_blank(self, tmp_path):
+        (tmp_path / ".symdexignore").write_text(
+            "node_modules\n\n# comment\n  vendor  \n",
+            encoding="utf-8",
+        )
+        assert load_symdexignore(tmp_path) == ["node_modules", "vendor"]
 
 
 # =============================================================================

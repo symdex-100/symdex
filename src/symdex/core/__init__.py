@@ -8,6 +8,7 @@ Re-exports the primary classes for convenience::
 
 from symdex.core.config import Config, CypherSchema, Prompts, SymdexConfig
 from symdex.core.engine import (
+    CallSite,
     CodeAnalyzer,
     CypherCache,
     CypherGenerator,
@@ -24,6 +25,7 @@ __all__ = [
     "CypherSchema",
     "Prompts",
     "SymdexConfig",
+    "CallSite",
     "CodeAnalyzer",
     "CypherCache",
     "CypherGenerator",

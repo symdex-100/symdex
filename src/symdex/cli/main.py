@@ -76,7 +76,10 @@ def cli(ctx: click.Context, provider: str | None):
     Commands:
       index   Build a sidecar index from Python source (uses LLM for Cyphers).
       search  Query the index by natural language or Cypher pattern.
-      stats   Show index statistics (files, functions).
+      stats   Show index statistics (files, functions, call edges).
+      callers Find functions that call a given function (call graph).
+      callees Find functions called by a given function (call graph).
+      trace   Recursively trace the call chain (callers or callees).
       watch   Watch a directory and auto-reindex on file changes.
       mcp     Start the MCP server for Cursor / Claude.
 
@@ -321,7 +324,7 @@ def _display_console_results(
               help="Directory containing the index (default: ./.symdex).")
 @click.pass_context
 def stats(ctx: click.Context, cache_dir: str | None):
-    """Show Symdex index statistics (indexed files and function count)."""
+    """Show Symdex index statistics (indexed files, functions, call edges)."""
     cfg: SymdexConfig = ctx.obj["config"]
     cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
     db = cfg.get_cache_path(cache_path)
@@ -338,7 +341,213 @@ def stats(ctx: click.Context, cache_dir: str | None):
     click.echo()
     click.echo(f"  Indexed files     {s['indexed_files']:>8,}")
     click.echo(f"  Indexed functions {s['indexed_functions']:>8,}")
+    click.echo(f"  Call edges        {s.get('call_edges', 0):>8,}  (for callers/callees/trace)")
     click.echo("─" * 50)
+
+
+# ---------------------------------------------------------------------------
+# symdex callers
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("function_name")
+@click.option("--cache-dir", type=click.Path(), default=None,
+              help="Directory containing the index (default: ./.symdex).")
+@click.option("--context-lines", type=int, default=3,
+              help="Lines of code preview per result (default: 3).")
+@click.option("-f", "--format", "fmt",
+              type=click.Choice(["console", "json", "compact", "ide"]),
+              default="console",
+              help="Output format (default: console).")
+@click.pass_context
+def callers(ctx: click.Context, function_name: str, cache_dir: str | None,
+            context_lines: int, fmt: str):
+    """Find functions that call FUNCTION_NAME (call graph).
+
+    Requires an index built with 'symdex index'. Call edges are extracted
+    at index time. Example: symdex callers add_cypher_entry
+    """
+    cfg: SymdexConfig = ctx.obj["config"]
+    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
+    db = cfg.get_cache_path(cache_path)
+    if not db.exists():
+        click.echo(f"Error: Index not found at {db}. Run 'symdex index' first.", err=True)
+        raise SystemExit(1)
+    engine = CypherSearchEngine(cache_path, config=cfg)
+    results = engine.get_callers(function_name, context_lines=context_lines)
+    _emit_call_graph_results(results, fmt, caller_or_callee=f"Callers of '{function_name}' (functions that call it):")
+
+
+# ---------------------------------------------------------------------------
+# symdex callees
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("function_name")
+@click.option("--cache-dir", type=click.Path(), default=None,
+              help="Directory containing the index (default: ./.symdex).")
+@click.option("--file-path", type=click.Path(), default=None,
+              help="Source file path to disambiguate when function name exists in multiple files.")
+@click.option("--context-lines", type=int, default=3,
+              help="Lines of code preview per result (default: 3).")
+@click.option("-f", "--format", "fmt",
+              type=click.Choice(["console", "json", "compact", "ide"]),
+              default="console",
+              help="Output format (default: console).")
+@click.pass_context
+def callees(ctx: click.Context, function_name: str, cache_dir: str | None,
+            file_path: str | None, context_lines: int, fmt: str):
+    """Find functions called by FUNCTION_NAME (call graph).
+
+    Only returns callees that are themselves indexed. Example: symdex callees _process_function
+    """
+    cfg: SymdexConfig = ctx.obj["config"]
+    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
+    db = cfg.get_cache_path(cache_path)
+    if not db.exists():
+        click.echo(f"Error: Index not found at {db}. Run 'symdex index' first.", err=True)
+        raise SystemExit(1)
+    engine = CypherSearchEngine(cache_path, config=cfg)
+    results = engine.get_callees(function_name, file_path=file_path, context_lines=context_lines)
+    _emit_call_graph_results(results, fmt, caller_or_callee=f"Callees of '{function_name}' (functions it calls):")
+
+
+# ---------------------------------------------------------------------------
+# symdex trace
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("function_name")
+@click.option("--direction",
+              type=click.Choice(["callers", "callees"]),
+              default="callers",
+              help="callers = who calls this (walk up), callees = what this calls (walk down).")
+@click.option("--depth", "max_depth", type=int, default=5,
+              help="Maximum recursion depth (default: 5).")
+@click.option("--cache-dir", type=click.Path(), default=None,
+              help="Directory containing the index (default: ./.symdex).")
+@click.option("--context-lines", type=int, default=2,
+              help="Lines of code preview per node (default: 2).")
+@click.option("-f", "--format", "fmt",
+              type=click.Choice(["console", "json"]),
+              default="console",
+              help="Output format (default: console).")
+@click.pass_context
+def trace(ctx: click.Context, function_name: str, direction: str, max_depth: int,
+          cache_dir: str | None, context_lines: int, fmt: str):
+    """Trace the call chain from FUNCTION_NAME (call graph).
+
+    Walk up (who calls this) or down (what this calls) recursively.
+    Cycles are detected and will not cause infinite recursion.
+    Example: symdex trace add_cypher_entry --direction callers --depth 4
+    """
+    cfg: SymdexConfig = ctx.obj["config"]
+    cache_path = Path(cache_dir).resolve() if cache_dir else (Path.cwd() / cfg.symdex_dir)
+    db = cfg.get_cache_path(cache_path)
+    if not db.exists():
+        click.echo(f"Error: Index not found at {db}. Run 'symdex index' first.", err=True)
+        raise SystemExit(1)
+    engine = CypherSearchEngine(cache_path, config=cfg)
+    chain = engine.trace_call_chain(
+        function_name, direction=direction, max_depth=max_depth, context_lines=context_lines,
+    )
+    if fmt == "json":
+        import json
+        click.echo(json.dumps({"root": function_name, "direction": direction, "max_depth": max_depth, "chain": chain}, indent=2))
+    else:
+        click.echo(f"  SYMDEX — Call chain from '{function_name}' ({direction}, max_depth={max_depth})")
+        click.echo("─" * 60)
+        for node in chain:
+            indent = "  " * node.get("depth", 0)
+            click.echo(f"  {indent}depth {node['depth']}: {node['function_name']} @ {node['file_path']}:{node['line_start']}")
+        click.echo("─" * 60)
+
+
+def _emit_call_graph_results(results: list, fmt: str, *, caller_or_callee: str = "") -> None:
+    """Print get_callers/get_callees results in the chosen format.
+
+    caller_or_callee: short label for the relationship, e.g. "Callees of get_stats"
+    or "Callers of add_cypher_entry", used in console header when results are non-empty.
+    """
+    formatter = ResultFormatter()
+    if fmt == "json":
+        click.echo(formatter.format_json(results))
+    elif fmt == "compact":
+        click.echo(formatter.format_compact(results))
+    elif fmt == "ide":
+        click.echo(formatter.format_ide(results))
+    else:
+        # Console: prepend a one-line hint so the relationship is clear
+        if results and caller_or_callee:
+            click.echo(f"  {caller_or_callee}")
+            click.echo("")
+        click.echo(formatter.format_console(results, elapsed_time=None))
+
+
+# ---------------------------------------------------------------------------
+# symdex watch
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("directory", default=".", type=click.Path(exists=True, file_okay=False))
+@click.option("--interval", type=int, default=300,
+              help="Minimum seconds between re-indexes (default: 300).")
+@click.option("--debounce", type=int, default=5,
+              help="Seconds to wait after last file change before re-indexing (default: 5).")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def watch(ctx: click.Context, directory: str, interval: int, debounce: int, verbose: bool):
+    """Watch DIRECTORY and auto-reindex when Python files change.
+
+    Uses watchdog for real-time file events if installed (pip install watchdog),
+    otherwise falls back to polling every --interval seconds. Press Ctrl+C to stop.
+    """
+    import signal
+    import threading
+    import time
+    cfg: SymdexConfig = ctx.obj["config"]
+    _configure_logging(verbose, cfg)
+    _validate_config(cfg)
+
+    root_dir = Path(directory).resolve()
+    from symdex import Symdex
+    from symdex.core.autoreindex import start_auto_reindex
+
+    client = Symdex(config=cfg)
+    # Initial index so the index exists before watching
+    try:
+        click.echo(f"Initial index of {root_dir}...")
+        result = client.index(root_dir, show_progress=True)
+        click.echo(f"Indexed {result.files_processed} files, {result.functions_indexed} functions.")
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    reindexer = start_auto_reindex(
+        root_dir, client,
+        interval_seconds=interval,
+        debounce_seconds=debounce,
+    )
+    shutdown = threading.Event()
+
+    def _on_sig(_signum, _frame):
+        shutdown.set()
+
+    try:
+        signal.signal(signal.SIGINT, _on_sig)
+    except (ValueError, OSError):
+        # Signal only valid in main thread; or unsupported on this platform
+        pass
+
+    click.echo(f"Watching for changes (interval={interval}s, debounce={debounce}s). Press Ctrl+C to stop.")
+    try:
+        while not shutdown.is_set():
+            shutdown.wait(timeout=1)
+    except KeyboardInterrupt:
+        shutdown.set()
+    finally:
+        reindexer.stop()
+        click.echo("Stopped.")
 
 
 # ---------------------------------------------------------------------------

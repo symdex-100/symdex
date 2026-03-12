@@ -28,6 +28,11 @@ PAT = Pattern   (ASY, SYN, REC, GEN, DEC, CTX, CLS)
 **Example:** `SEC:VAL_TOKEN--ASY` means "Security domain, validates a
 token, async pattern."
 
+**Highlights for agents:**
+- **Path vs scope:** `path` is the index root (where `.symdex/index.db` lives). Use `directory_scope` to restrict results to a subtree (e.g. `"src/auditor"`) without a separate index.
+- **Celery / task callers:** Invocations like `validate_task.delay()` or `task.apply_async()` are indexed as call edges to the task; `get_callers(task_name)` finds who triggers the task.
+- **Filter by domain/action:** Use `domain_filter` and `action_filter` (e.g. `["BIZ", "NET"]`) to narrow search and call-graph results; use `group_by="domain"` or `"action"` to get results grouped in JSON.
+
 ---
 
 ## When to use Symdex
@@ -52,28 +57,38 @@ token, async pattern."
 5. **You'd otherwise read 3+ files** — If your task requires reading
    multiple files to find the right function, use Symdex first.
 
+6. **You need to trace execution flow** — Use `get_callers` ("who calls X?"),
+   `get_callees` ("what does X call?"), or `trace_call_chain` to walk the
+   call graph without manually reading files or grepping. **Celery (and similar) task invocations** (e.g. `validate_vulnerabilities_task.delay()`) are indexed as call edges to the task function, so "who triggers this task?" is discoverable via `get_callers(task_name)`.
+
 ### DO NOT use Symdex when:
 
 1. **You already know the exact file and line** — just read it directly.
 2. **You're searching for a specific string/identifier** — use grep or
    IDE search instead.
-3. **The project has not been indexed** — call `index_directory` first,
+3. **You need exhaustive call-site listing** — e.g. "find every call site
+   of `User.objects.create` / `get_or_create`". Symdex is best for
+   intent-based discovery ("where do we do X?"); for listing every
+   occurrence of an exact pattern, use grep (or similar text search).
+4. **The project has not been indexed** — call `index_directory` first,
    or fall back to normal code exploration.
-4. **Very small codebases** (<50 functions) — indexing overhead
+5. **Very small codebases** (<50 functions) — indexing overhead
    outweighs benefits; just read files directly.
 
 ---
 
 ## Available MCP tools
 
-If Symdex is configured as an MCP server, you have these tools:
+If Symdex is configured as an MCP server, you have these tools. **Server identifier:** When calling tools via `call_mcp_tool`, use the **server identifier** (the key in `mcpServers`, e.g. `symdex` or `user-symdex`), not the display name (Symdex-100).
 
-### `search_codebase(query, path=".", strategy="auto", max_results=10, context_lines=3, exclude_tests=None)`
+### `search_codebase(query, path=".", strategy="auto", max_results=10, context_lines=3, exclude_tests=None, directory_scope=None, domain_filter=None, action_filter=None, group_by=None)`
 
 **Your primary tool.** Pass a natural-language query or Cypher pattern.
 
 - **Natural language:** The LLM returns **three** Cypher patterns (tight, medium, broad). The engine tries the tight pattern first and only broadens if needed, so you get fewer irrelevant results and faster, more focused hits. Results are ranked against the tight pattern.
 - **Reported time** in tool output is **DB-only** (index lookup, scoring, context); LLM translation time is not included.
+
+**Path vs directory_scope:** `path` must be the **index root** (the directory that contains `.symdex/index.db`). To restrict results to a **subtree** of the repo (e.g. only `src/auditor`), keep `path` as the repo root and set `directory_scope` to that relative path (e.g. `directory_scope="src/auditor"`). Searching with `path` set to a subdirectory that has no `.symdex/` will fail with "No Symdex index found".
 
 **Parameters you can pass explicitly (recommended when the agent needs to adapt):**
 
@@ -81,9 +96,14 @@ If Symdex is configured as an MCP server, you have these tools:
 |-----------|--------|-------------------|
 | `context_lines` | 3 (or server default) | Use **10–15** when you need to **edit** the found code (more context per result). Use **3** for quick exploration. |
 | `exclude_tests` | config default (**true**) | Set to **false** to include test code. When omitted, uses config (default: exclude tests for normal use). |
+| `directory_scope` | None | Set to a path relative to index root (e.g. `"src/step_5/vulnerability_analysis"`) to restrict results to that subtree. |
+| `domain_filter` | None | List of Cypher domains (e.g. `["BIZ", "NET"]`) to keep only matching results. |
+| `action_filter` | None | List of Cypher actions (e.g. `["FET", "SND"]`) to keep only matching results. |
+| `group_by` | None | Set to `"domain"` or `"action"` to return results grouped by Cypher domain or action. |
 
 **How an AI should create the query:**
 
+- **Prefer specific intent** — e.g. "Django User model create or save" surfaces the actual user-creation functions; broad phrases like "create users in the database" can mix tables, sessions, TypeDB users, etc.
 - **Exploration / “find where X”:** Use defaults (`context_lines=3`, tests excluded by default). Pass `exclude_tests=false` to include test code.
 - **Editing / “change the function that does X”:** Call with `context_lines=15`; tests remain excluded by default.
 
@@ -109,9 +129,9 @@ search_codebase("DAT:*_*--*")  → all Data-domain functions
 
 **Returns:** JSON array of `{function_name, file_path, line_start, line_end, cypher, score, context}`.
 
-### `search_by_cypher(cypher_pattern, path=".", max_results=10)`
+### `search_by_cypher(cypher_pattern, path=".", max_results=10, directory_scope=None, domain_filter=None, action_filter=None)`
 
-Direct pattern search — no LLM translation.  Faster, deterministic.
+Direct pattern search — no LLM translation.  Faster, deterministic.  Supports `directory_scope` and Cypher domain/action filters like `search_codebase`.
 
 ```
 search_by_cypher("SEC:VAL_*--SYN")   → all sync security validation
@@ -126,8 +146,31 @@ shows 0 indexed files.
 
 ### `get_index_stats(path=".")`
 
-Returns `{indexed_files, indexed_functions}`.  Use to check if indexing
-has been done.
+Returns `{indexed_files, indexed_functions, call_edges}`.  Use to check if
+indexing has been done.  `call_edges` is the number of caller→callee
+relationships (built at index time) used by the call-graph tools.
+
+### `get_callers(function_name, path=".", context_lines=None, directory_scope=None, domain_filter=None, action_filter=None)`
+
+Find **who calls** a given function.  Use to answer "where is X invoked?"
+Includes callers that invoke Celery tasks via `.delay()` or `.apply_async()`.
+Optional `directory_scope` and `domain_filter` / `action_filter` restrict results.
+Returns a JSON array of caller functions with file, line, cypher, and context.
+
+### `get_callees(function_name, path=".", file_path=None, context_lines=None, directory_scope=None, domain_filter=None, action_filter=None)`
+
+Find **what** a given function **calls** (only indexed callees).  Use to
+trace execution flow downward.  Pass `file_path` to disambiguate when the
+function name exists in multiple files.  Optional scope and domain/action filters.
+Returns a JSON array of callee functions with file, line, cypher, and context.
+
+### `trace_call_chain(function_name, path=".", direction="callers", max_depth=5, context_lines=None, directory_scope=None, domain_filter=None, action_filter=None)`
+
+Recursively trace the call graph from a function.  **direction**: `"callers"`
+(walk up) or `"callees"` (walk down).  **max_depth** limits recursion; cycles
+are detected.  Optional `directory_scope` and `domain_filter` / `action_filter`
+restrict which nodes appear in the chain.  Returns JSON with `root`, `direction`,
+`max_depth`, and a `chain` array of nodes.
 
 ### `health()`
 
@@ -197,12 +240,21 @@ hits = client.search("validate user tokens", path="./project", explain=True)
 print(hits[0].explanation)
 # {'action_match': 6.0, 'object_match': 5.0, 'name_matches': {'exact': 1, 'score': 3.0}}
 
-# Get stats
+# Get stats (includes indexed_files, indexed_functions, call_edges)
 stats = client.stats("./project")
+
+# Call graph: who calls X? what does X call? trace chain
+callers = client.get_callers("encrypt_file_content", path="./project")
+callees = client.get_callees("process_files", path="./project")
+chain = client.trace_call_chain("add_cypher_entry", direction="callers", max_depth=4, path="./project")
+
+# Scoped search and filters (path = index root; directory_scope = subtree; domain_filter = e.g. ["BIZ", "NET"])
+hits = client.search("validate workflow", path="./project", directory_scope="src/auditor", domain_filter=["BIZ", "NET"])
 ```
 
 Async variants are available: `client.aindex()`, `client.asearch()`,
-`client.astats()`.
+`client.astats()`, `client.aget_callers()`, `client.aget_callees()`,
+`client.atrace_call_chain()`.
 
 ---
 
@@ -227,7 +279,11 @@ Async variants are available: `client.aindex()`, `client.asearch()`,
              → You now have precise context, not a haystack
              → OR if context_lines was high enough, edit directly from search result
 
-6. Act:     Make your edit / answer the question / generate the code
+6. Call flow (optional):  get_callers("function_name") or get_callees("function_name")
+             → Or trace_call_chain("function_name", direction="callers", max_depth=5)
+             → Use when you need to see who calls X or what X calls, without manual grep
+
+7. Act:     Make your edit / answer the question / generate the code
 ```
 
 **Key insight:** Start with `context_lines=3` for exploration (cheap, fast). Once you've identified the right function, either:

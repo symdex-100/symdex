@@ -54,7 +54,7 @@ class SymdexConfig:
     retry_backoff_base: float = 2.0
 
     # ── File Processing ───────────────────────────────────────────
-    target_extensions: frozenset = frozenset((".py",))
+    target_extensions: frozenset = frozenset((".py", ".js", ".jsx", ".ts", ".tsx"))
     exclude_dirs: frozenset = frozenset((
         "__pycache__", ".git", ".venv", "venv",
         ".pytest_cache", "dist", "build", ".symdex",
@@ -137,13 +137,17 @@ class SymdexConfig:
                 return False
             return default
 
+        def _key_env(name: str) -> Optional[str]:
+            raw = os.getenv(name)
+            return raw.strip() if raw else None
+
         return cls(
             llm_provider=os.getenv("SYMDEX_LLM_PROVIDER", "anthropic").lower(),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            anthropic_api_key=_key_env("ANTHROPIC_API_KEY"),
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_api_key=_key_env("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY"),
+            gemini_api_key=_key_env("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
             llm_max_tokens=_int_env("SYMDEX_MAX_TOKENS", 300),
             min_search_score=float(os.getenv("CYPHER_MIN_SCORE", "5.0")),
@@ -246,9 +250,9 @@ class Config:
     RETRY_ATTEMPTS: int = 3
     RETRY_BACKOFF_BASE: float = 2.0
     
-    # File Processing — Python only (v1)
+    # File Processing — Python and JavaScript/TypeScript (built-in)
     # frozenset for O(1) membership tests during directory scanning
-    TARGET_EXTENSIONS: frozenset = frozenset((".py",))
+    TARGET_EXTENSIONS: frozenset = frozenset((".py", ".js", ".jsx", ".ts", ".tsx"))
     EXCLUDE_DIRS: frozenset = frozenset((
         "__pycache__", ".git", ".venv", "venv",
         ".pytest_cache", "dist", "build",
@@ -500,8 +504,9 @@ class CypherSchema:
         "LOG", "LOGS", "METRIC", "EVENT", "TRACE",
         # Models & ML
         "MODEL", "EMBED", "VECTOR", "FEATURE", "LABEL",
-        # Misc domain objects
+        # Misc domain objects (NODE/COMPONENT for UI; EVENT for handlers)
         "NODE", "EDGE", "GRAPH", "JOB", "TASK", "MSG", "MESSAGE",
+        "COMPONENT", "EVENT",
         "ORDER", "ITEM", "PRODUCT",
         # Relationship / association objects
         "RELATIONSHIP", "RELATIONSHIPS", "LINK", "REF",
@@ -564,7 +569,12 @@ RULES:
 3. If uncertain, choose the most specific applicable code. Prefer 2-part OBJ when in doubt between one broad vs two specific objects.
 4. Output ONLY the Cypher string, nothing else — no explanations, no caveats.
 5. Be consistent: same code logic should always produce the same Cypher.
-6. **CRITICAL — Non-classifiable code:** If the code is NOT a complete function or method (fragment, branch, loop body, single statement, incomplete snippet), respond with exactly: SKIP
+6. **CRITICAL — When to SKIP:** Respond with exactly SKIP only when the code is genuinely NOT a function or method: e.g. a config/constant object, a re-export, or an incomplete code fragment. Do NOT skip:
+   - React/Vue/Svelte components (use DOM=UI, OBJ=COMPONENT or NODE, e.g. UI:CRT_COMPONENT--SYN).
+   - Event handlers (handleClick, onSubmit, etc.) — use UI:SYN_EVENT--SYN or UI:UPD_NODE--SYN.
+   - DOM helpers and predicates (isActiveFor, hasClass, checkElement, etc. — functions that validate or inspect DOM nodes) — use UI:VAL_NODE--SYN or UI:FLT_NODE--SYN.
+   - Callbacks, getters, setters, template helpers — classify by what they do (e.g. BIZ:FET_* or UI:TRN_NODE--SYN).
+   - Any named function that implements behavior is classifiable.
 
 EXAMPLES (single OBJ when one clear object; compound when multiple objects):
 - "async def send_email(to, subject): ..." → NET:SND_EMAL--ASY
@@ -572,11 +582,14 @@ EXAMPLES (single OBJ when one clear object; compound when multiple objects):
 - "def fetch_user_data(user_id): ..." → DAT:FET_USER--SYN
 - "def create_audit_entity_and_relations(repo_url, audit_result_uuid, ...): ..." → DAT:CRT_RELATIONSHIPS+AUDIT--SYN
 - "def store_developer_commits(self, audit_uuid): ..." → DAT:AGG_DATASET+DEVELOPER+COMMITS--SYN
+- "const BackgroundNumbers = () => {{ return <div>...</div>; }}" (React component) → UI:CRT_COMPONENT--SYN
+- "const handleClick = (e) => {{ setActive(id); }}" (event handler) → UI:SYN_EVENT--SYN
+- "function isActiveFor(pre) {{ ... return true/false; }}" (DOM predicate / helper) → UI:VAL_NODE--SYN
 """
     
-    CYPHER_GENERATION_USER = """Analyze this Python function and generate its Cypher.
+    CYPHER_GENERATION_USER = """Analyze this {language} function and generate its Cypher.
 
-```python
+```{code_fence}
 {code}
 ```
 

@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from symdex.core.config import SymdexConfig
 from symdex.core.engine import IndexResult, SearchResult
@@ -149,18 +149,24 @@ class Symdex:
         min_score: float | None = None,
         context_lines: int = 3,
         exclude_tests: bool | None = None,
+        directory_scope: str | None = None,
+        domain_filter: List[str] | None = None,
+        action_filter: List[str] | None = None,
     ) -> List[SearchResult]:
         """
         Search the Symdex index for functions matching *query*.
 
         Args:
             query: Natural-language description or Cypher pattern.
-            path: Root directory whose ``.symdex/`` index to search.
+            path: Root directory whose ``.symdex/`` index to search (must contain ``.symdex/index.db``).
             strategy: ``'auto'`` | ``'llm'`` | ``'keyword'`` | ``'direct'``.
             max_results: Maximum hits to return.
             min_score: Minimum relevance score threshold.
             context_lines: Lines of code context per result (default 3).
             exclude_tests: If True, filter out test functions. Default None uses config (True = exclude by default).
+            directory_scope: If set, restrict results to functions under this path (relative to index root).
+            domain_filter: If set, keep only results whose Cypher domain is in this list (e.g. ['BIZ', 'NET']).
+            action_filter: If set, keep only results whose Cypher action is in this list (e.g. ['FET', 'SND']).
 
         Returns:
             Ranked list of :class:`SearchResult` objects. Each result has
@@ -180,7 +186,11 @@ class Symdex:
 
         engine = self._get_engine(cache_dir)
         no_tests = exclude_tests if exclude_tests is not None else self._config.default_exclude_tests
-        results = engine.search(query, strategy=strategy, max_results=max_results, context_lines=context_lines, exclude_tests=no_tests)
+        results = engine.search(
+            query, strategy=strategy, max_results=max_results, context_lines=context_lines,
+            exclude_tests=no_tests, directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
 
         score_threshold = min_score if min_score is not None else self._config.min_search_score
         return [r for r in results if r.score >= score_threshold]
@@ -191,6 +201,9 @@ class Symdex:
         *,
         path: str | Path = ".",
         max_results: int = 10,
+        directory_scope: str | None = None,
+        domain_filter: List[str] | None = None,
+        action_filter: List[str] | None = None,
     ) -> List[SearchResult]:
         """
         Search by Cypher pattern directly (no LLM translation).
@@ -199,6 +212,9 @@ class Symdex:
             pattern: Cypher pattern with optional wildcards (``*``).
             path: Root directory whose index to search.
             max_results: Maximum hits to return.
+            directory_scope: If set, restrict results to functions under this path.
+            domain_filter: If set, keep only results whose Cypher domain is in this list.
+            action_filter: If set, keep only results whose Cypher action is in this list.
 
         Returns:
             Ranked list of :class:`SearchResult` objects (each has
@@ -213,7 +229,11 @@ class Symdex:
             raise IndexNotFoundError(f"No Symdex index found at {db}.")
 
         engine = self._get_engine(cache_dir)
-        return engine.search(pattern, strategy="direct", max_results=max_results)
+        return engine.search(
+            pattern, strategy="direct", max_results=max_results,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
 
     # ── Statistics ────────────────────────────────────────────────
 
@@ -242,6 +262,126 @@ class Symdex:
             return cache.get_stats()
         finally:
             cache.close()
+
+    # ── Call Graph ────────────────────────────────────────────────
+
+    def get_callers(
+        self,
+        function_name: str,
+        *,
+        path: str | Path = ".",
+        context_lines: int = 3,
+        directory_scope: str | None = None,
+        domain_filter: List[str] | None = None,
+        action_filter: List[str] | None = None,
+    ) -> List[SearchResult]:
+        """Find indexed functions that call the specified function.
+
+        Args:
+            function_name: Target function name.
+            path: Root directory whose ``.symdex/`` index to search.
+            context_lines: Lines of code context per result.
+            directory_scope: If set, restrict to callers under this path.
+            domain_filter: If set, keep only callers whose Cypher domain is in this list.
+            action_filter: If set, keep only callers whose Cypher action is in this list.
+
+        Returns:
+            List of :class:`SearchResult` objects for each caller.
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
+        """
+        cache_dir = Path(path).resolve() / self._config.symdex_dir
+        db = self._config.get_cache_path(cache_dir)
+        if not db.exists():
+            raise IndexNotFoundError(f"No Symdex index found at {db}.")
+        engine = self._get_engine(cache_dir)
+        return engine.get_callers(
+            function_name, context_lines=context_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
+
+    def get_callees(
+        self,
+        function_name: str,
+        *,
+        path: str | Path = ".",
+        file_path: str | None = None,
+        context_lines: int = 3,
+        directory_scope: str | None = None,
+        domain_filter: List[str] | None = None,
+        action_filter: List[str] | None = None,
+    ) -> List[SearchResult]:
+        """Find indexed functions called by the specified function.
+
+        Args:
+            function_name: Caller function name.
+            path: Root directory whose ``.symdex/`` index to search.
+            file_path: Optional source file path for disambiguation.
+            context_lines: Lines of code context per result.
+            directory_scope: If set, restrict to callees under this path.
+            domain_filter: If set, keep only callees whose Cypher domain is in this list.
+            action_filter: If set, keep only callees whose Cypher action is in this list.
+
+        Returns:
+            List of :class:`SearchResult` objects for each callee.
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
+        """
+        cache_dir = Path(path).resolve() / self._config.symdex_dir
+        db = self._config.get_cache_path(cache_dir)
+        if not db.exists():
+            raise IndexNotFoundError(f"No Symdex index found at {db}.")
+        engine = self._get_engine(cache_dir)
+        return engine.get_callees(
+            function_name, file_path=file_path, context_lines=context_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
+
+    def trace_call_chain(
+        self,
+        function_name: str,
+        *,
+        path: str | Path = ".",
+        direction: str = "callers",
+        max_depth: int = 5,
+        context_lines: int = 3,
+        directory_scope: str | None = None,
+        domain_filter: List[str] | None = None,
+        action_filter: List[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Trace the call chain from a function, walking up or down.
+
+        Args:
+            function_name: Starting function name.
+            path: Root directory whose ``.symdex/`` index to search.
+            direction: ``'callers'`` (up) or ``'callees'`` (down).
+            max_depth: Maximum recursion depth.
+            context_lines: Lines of code context per node.
+            directory_scope: If set, restrict to nodes under this path.
+            domain_filter: If set, keep only nodes whose Cypher domain is in this list.
+            action_filter: If set, keep only nodes whose Cypher action is in this list.
+
+        Returns:
+            List of dicts, each with function info and a ``depth`` field.
+
+        Raises:
+            IndexNotFoundError: If no index exists at *path*.
+        """
+        cache_dir = Path(path).resolve() / self._config.symdex_dir
+        db = self._config.get_cache_path(cache_dir)
+        if not db.exists():
+            raise IndexNotFoundError(f"No Symdex index found at {db}.")
+        engine = self._get_engine(cache_dir)
+        return engine.trace_call_chain(
+            function_name, direction=direction,
+            max_depth=max_depth, context_lines=context_lines,
+            directory_scope=directory_scope,
+            domain_filter=domain_filter, action_filter=action_filter,
+        )
 
     # ── Async variants ────────────────────────────────────────────
     # These use asyncio.to_thread() to run sync operations off the
@@ -292,6 +432,37 @@ class Symdex:
     async def astats(self, path: str | Path = ".") -> Dict[str, int]:
         """Async variant of :meth:`stats`. Raises same exceptions as sync."""
         return await asyncio.to_thread(self.stats, path)
+
+    async def aget_callers(
+        self, function_name: str, *, path: str | Path = ".",
+        context_lines: int = 3,
+    ) -> List[SearchResult]:
+        """Async variant of :meth:`get_callers`."""
+        return await asyncio.to_thread(
+            self.get_callers, function_name, path=path, context_lines=context_lines,
+        )
+
+    async def aget_callees(
+        self, function_name: str, *, path: str | Path = ".",
+        file_path: str | None = None, context_lines: int = 3,
+    ) -> List[SearchResult]:
+        """Async variant of :meth:`get_callees`."""
+        return await asyncio.to_thread(
+            self.get_callees, function_name, path=path,
+            file_path=file_path, context_lines=context_lines,
+        )
+
+    async def atrace_call_chain(
+        self, function_name: str, *, path: str | Path = ".",
+        direction: str = "callers", max_depth: int = 5,
+        context_lines: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Async variant of :meth:`trace_call_chain`."""
+        return await asyncio.to_thread(
+            self.trace_call_chain, function_name, path=path,
+            direction=direction, max_depth=max_depth,
+            context_lines=context_lines,
+        )
 
     # ── Health (for agents / status endpoints) ─────────────────────
 
