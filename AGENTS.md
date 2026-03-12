@@ -66,16 +66,20 @@ token, async pattern."
 1. **You already know the exact file and line** — just read it directly.
 2. **You're searching for a specific string/identifier** — use grep or
    IDE search instead.
-3. **The project has not been indexed** — call `index_directory` first,
+3. **You need exhaustive call-site listing** — e.g. "find every call site
+   of `User.objects.create` / `get_or_create`". Symdex is best for
+   intent-based discovery ("where do we do X?"); for listing every
+   occurrence of an exact pattern, use grep (or similar text search).
+4. **The project has not been indexed** — call `index_directory` first,
    or fall back to normal code exploration.
-4. **Very small codebases** (<50 functions) — indexing overhead
+5. **Very small codebases** (<50 functions) — indexing overhead
    outweighs benefits; just read files directly.
 
 ---
 
 ## Available MCP tools
 
-If Symdex is configured as an MCP server, you have these tools:
+If Symdex is configured as an MCP server, you have these tools. **Server identifier:** When calling tools via `call_mcp_tool`, use the **server identifier** (the key in `mcpServers`, e.g. `symdex` or `user-symdex`), not the display name (Symdex-100).
 
 ### `search_codebase(query, path=".", strategy="auto", max_results=10, context_lines=3, exclude_tests=None, directory_scope=None, domain_filter=None, action_filter=None, group_by=None)`
 
@@ -99,6 +103,7 @@ If Symdex is configured as an MCP server, you have these tools:
 
 **How an AI should create the query:**
 
+- **Prefer specific intent** — e.g. "Django User model create or save" surfaces the actual user-creation functions; broad phrases like "create users in the database" can mix tables, sessions, TypeDB users, etc.
 - **Exploration / “find where X”:** Use defaults (`context_lines=3`, tests excluded by default). Pass `exclude_tests=false` to include test code.
 - **Editing / “change the function that does X”:** Call with `context_lines=15`; tests remain excluded by default.
 

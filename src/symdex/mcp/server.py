@@ -108,7 +108,7 @@ def create_server(config: SymdexConfig | None = None):
     def search_codebase(
         query: Annotated[
             str,
-            Field(default="", description="Natural-language query (e.g., 'validate user tokens') or Cypher pattern (e.g., 'SEC:VAL_TOKEN--*'). Use natural language for intent-based search; use Cypher patterns when you know the exact semantic fingerprint structure. Required for meaningful results.")
+            Field(default="", description="Natural-language query (e.g., 'validate user tokens') or Cypher pattern (e.g., 'SEC:VAL_TOKEN--*'). Prefer a specific intent (e.g. 'Django User model create or save') over broad phrases ('create users in the database') so the right functions rank higher. Use Cypher patterns when you know the exact semantic fingerprint. Required for meaningful results.")
         ] = "",
         path: Annotated[
             str,
@@ -651,7 +651,7 @@ SERVER_CARD = {
     "serverInfo": {"name": "Symdex-100", "version": "1.2.1"},
     "authentication": {"required": False, "schemes": []},
     "tools": [
-        {"name": "search_codebase", "description": "Search by natural-language or Cypher. Optional: directory_scope (subtree), domain_filter, action_filter, group_by (domain|action).", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
+        {"name": "search_codebase", "description": "Search by natural-language or Cypher. Prefer specific intent (e.g. 'Django User model create'). Optional: directory_scope (subtree), domain_filter, action_filter, group_by (domain|action).", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "strategy": {"type": "string"}, "max_results": {"type": "integer"}}}},
         {"name": "search_by_cypher", "description": "Find code by Cypher pattern (no LLM). Optional: directory_scope, domain_filter, action_filter.", "inputSchema": {"type": "object", "properties": {"cypher_pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}}},
         {"name": "index_directory", "description": "Index source files into .symdex/ sidecar.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "force": {"type": "boolean"}}}},
         {"name": "get_index_stats", "description": "Return index statistics for a directory.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},

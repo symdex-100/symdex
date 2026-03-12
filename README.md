@@ -346,6 +346,8 @@ await searchCodebase({ query: "validate token", context_lines: 15 });
 - You'd otherwise read 3+ files to find the right function
 - Codebase has 200+ functions (indexing overhead paid off)
 
+**Use grep (or text search) when:** You need an exhaustive list of every call site of an exact pattern (e.g. every `User.objects.create` / `get_or_create`). Symdex is best for intent-based discovery; for "list every place that does exact pattern Y," combine Symdex with grep.
+
 **Example agent workflow:**
 ```
 1. explore_codebase("how does authentication work")
@@ -607,6 +609,8 @@ Symdex provides a full MCP (Model Context Protocol) server with **tools**, **res
 }
 ```
 
+The key you use in `mcpServers` (e.g. `"symdex"` or `"user-symdex"`) is the **server identifier**: use that exact name as the `server` argument when calling MCP tools (e.g. `call_mcp_tool(server="symdex", ...)`). The display name "Symdex-100" is for UI only.
+
 4. **Reload:** Restart Cursor or run "MCP: Restart" so it starts the server. The server uses **stdio** by default (no port needed).
 
 **Test:** Open a chat and ask the agent to run `get_index_stats` for `.` or `search_codebase("validate user")`; if the index exists you should get results.
@@ -617,7 +621,7 @@ If `symdex` is not on PATH (e.g. you use a venv and Cursor runs without it), set
 
 | Tool | Description |
 |------|-------------|
-| `search_codebase(query, …)` | Natural-language or Cypher search. Optional: `directory_scope` (subtree), `domain_filter`, `action_filter`, `group_by`. |
+| `search_codebase(query, …)` | Natural-language or Cypher search. Prefer a specific intent (e.g. "Django User model create"). Optional: `directory_scope`, `domain_filter`, `action_filter`, `group_by`. |
 | `search_by_cypher(cypher_pattern, …)` | Direct Cypher lookup (no LLM). Optional: `directory_scope`, `domain_filter`, `action_filter`. |
 | `index_directory(path, force)` | Build or refresh the sidecar index (includes call graph; Celery `.delay()`/`.apply_async()` → task edges). |
 | `get_index_stats(path)` | File, function, and call_edges counts. |
