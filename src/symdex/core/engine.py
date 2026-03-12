@@ -919,13 +919,18 @@ class CypherGenerator:
         if getattr(cfg, "cypher_fallback_only", False):
             return self._generate_fallback_cypher(metadata)
 
-        # Fast-path: known boilerplate methods almost always get SKIP; avoid LLM call.
-        _BOILERPLATE_NAMES = frozenset({
+        # Fast-path: names that are not classifiable or would waste an LLM call.
+        _SKIP_NAMES = frozenset({
             "setUp", "tearDown", "setUpClass", "tearDownClass", "setUpModule", "tearDownModule",
             "__init__", "__new__", "__enter__", "__exit__", "__repr__", "__str__",
+            "<anonymous>",  # JS/TS arrow functions, callbacks, etc.
         })
-        if metadata.name in _BOILERPLATE_NAMES:
-            logger.debug(f"Skip LLM for boilerplate '{metadata.name}'")
+        if metadata.name in _SKIP_NAMES:
+            logger.debug(f"Skip LLM for '{metadata.name}' (boilerplate or anonymous)")
+            return None
+        # Symbol-only or minified names (e.g. $$, $) — skip without calling LLM.
+        if not metadata.name or not any(c.isalpha() for c in metadata.name):
+            logger.debug(f"Skip LLM for '{metadata.name}' (not a classifiable identifier)")
             return None
 
         for attempt in range(1, cfg.retry_attempts + 1):
@@ -946,9 +951,9 @@ class CypherGenerator:
 
                 # ── Explicit SKIP: LLM says the code is not classifiable ──
                 if stripped.upper().startswith("SKIP"):
-                    logger.info(
-                        f"LLM returned SKIP for '{metadata.name}' — "
-                        "code fragment is not a classifiable function."
+                    logger.debug(
+                        "LLM returned SKIP for '%s' — code fragment not classifiable",
+                        metadata.name,
                     )
                     return None
 

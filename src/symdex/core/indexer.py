@@ -149,6 +149,9 @@ class IndexingPipeline:
 
         if not files_to_process:
             logger.info("All files are up to date. Nothing to do.")
+            logger.info(
+                "Tip: Run with --force to re-index everything (e.g. after changing prompts or an aborted run)."
+            )
             return self._build_result()
 
         # ── Steps 3-4: Process files (parse → LLM → store) ──────
@@ -199,13 +202,20 @@ class IndexingPipeline:
         )
 
     def _process_file(self, file_path: Path) -> bool:
-        """Process a single Python source file."""
+        """Process a single source file (Python or JS/TS)."""
         try:
             source_code = file_path.read_text(encoding='utf-8')
 
             # Extract functions
             functions = self.analyzer.extract_functions(source_code, str(file_path))
             self.stats["functions_found"] += len(functions)
+
+            if len(functions) > 80:
+                logger.info(
+                    "  … Processing %s (%s functions, may take a minute)",
+                    file_path.name,
+                    len(functions),
+                )
 
             if not functions:
                 logger.debug(f"No functions found in {file_path}")
